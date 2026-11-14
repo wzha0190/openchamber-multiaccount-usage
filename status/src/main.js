@@ -100,10 +100,18 @@ const render = () => {
       body.append(metricRow(window.label, sub, value, tone(percent), reset && `Resets ${reset}`));
     }
     if (account.credits) body.append(metricRow('Credits', '', account.credits));
+    const nextTry = account.retryAt ? ` · next try ${formatReset(account.retryAt)}` : '';
+    const limitedTip = 'Anthropic limits how often an account’s usage can be read, shared by every app that reads it '
+      + '(Claude Code, OpenChamber’s Claude card, other devices). This does not affect using Claude.';
     if (account.stale && account.updatedAt) {
       const minutes = Math.max(1, Math.round((Date.now() - account.updatedAt) / 60_000));
-      const note = el('div', 'note', `Updated ${minutes} min ago`);
-      note.title = 'Anthropic is rate-limiting usage reads; showing the last reading. This does not affect using Claude.';
+      const note = el('div', 'note', `Updated ${minutes} min ago${nextTry}`);
+      note.title = limitedTip;
+      body.append(note);
+    }
+    if (account.waiting) {
+      const note = el('div', 'note', `Usage reads are rate-limited${nextTry}`);
+      note.title = limitedTip;
       body.append(note);
     }
     if (account.error) {

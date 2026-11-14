@@ -37,7 +37,7 @@ const CODEX_METHODS = new Set(['chatgpt-browser', 'chatgpt-headless']);
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_ERROR_LENGTH = 2_000;
 // Anthropic rate-limits its usage endpoint hard; Codex is gentler.
-const CACHE_MS = { codex: 60_000, claude: 300_000, zen: 120_000 };
+const CACHE_MS = { codex: 60_000, claude: 600_000, zen: 120_000 };
 const FORCE_FLOOR_MS = { codex: 0, claude: 120_000, zen: 15_000 };
 const FORCE_MIN_MS = 15_000;
 const CLAUDE_COOLDOWN_DEFAULT_MS = 5 * 60_000;
@@ -424,6 +424,41 @@ const cache = new Map();
 let pending = null;
 let lastForcedAt = 0;
 
+// Last readings and Claude back-off survive a service restart (OpenChamber
+// stops idle services and restarts them on pause/resume), so a restart neither
+// blanks the section nor spends a fresh request on a rate-limited account.
+// Holds usage numbers and timestamps only, never tokens.
+const STATE_FILE = path.join(home, '.cache', 'openchamber-accounts-usage', 'state.json');
+const STATE_MAX_AGE_MS = 24 * 3600 * 1000;
+
+const loadState = () => {
+  const state = readJson(STATE_FILE);
+  if (!state) return;
+  const now = Date.now();
+  for (const [key, entry] of Object.entries(state.cache ?? {})) {
+    if (entry && typeof entry.at === 'number' && now - entry.at < STATE_MAX_AGE_MS) cache.set(key, entry);
+  }
+  for (const [key, entry] of Object.entries(state.cooldowns ?? {})) {
+    if (entry && typeof entry.until === 'number' && entry.until > now) claudeCooldowns.set(key, entry);
+  }
+};
+
+const saveState = () => {
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true, mode: 0o700 });
+    const temp = `${STATE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify({
+      cache: Object.fromEntries(cache),
+      cooldowns: Object.fromEntries(claudeCooldowns),
+    }), { mode: 0o600 });
+    fs.renameSync(temp, STATE_FILE);
+  } catch {
+    // Persistence is best-effort; the in-memory state still works.
+  }
+};
+
+loadState();
+
 const readAccount = async (account, force) => {
   const cached = cache.get(account.key);
   // A forced refresh still keeps Claude at most one read per 2 min.
@@ -434,11 +469,16 @@ const readAccount = async (account, force) => {
     const usage = await fetcher(account);
     const result = { ...usage, error: null, updatedAt: Date.now() };
     cache.set(account.key, { at: Date.now(), result });
+    saveState();
     return result;
   } catch (error) {
+    saveState();
     // A rate limit keeps the last good numbers on screen, marked stale; the
-    // section shows their age instead of an error.
-    if (error?.keepLast && cached) return { ...cached.result, error: null, stale: true };
+    // section shows their age instead of an error. With no reading yet it says
+    // when the next try is, rather than showing an error.
+    const retryAt = claudeCooldowns.get(account.key)?.until ?? null;
+    if (error?.keepLast && cached) return { ...cached.result, error: null, stale: true, retryAt };
+    if (error?.keepLast) return { windows: [], credits: null, plan: null, error: null, waiting: true, retryAt, updatedAt: null };
     return { windows: [], credits: null, plan: null, error: errorText(error), updatedAt: null };
   }
 };
@@ -478,6 +518,8 @@ const collectUncoalesced = async (force) => {
       credits: result.credits,
       error: result.error ? result.error.slice(0, 300) : null,
       stale: Boolean(result.stale),
+      waiting: Boolean(result.waiting),
+      retryAt: result.retryAt ?? null,
       updatedAt: result.updatedAt,
     };
   }));

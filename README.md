@@ -40,7 +40,7 @@ change to the extension:
 
 Percentages turn amber at 70 % and red at 90 %. Credits rows only appear when an
 account has a positive or unlimited balance. The section polls every minute;
-results are cached for 1 min (Codex) / 2 min (OpenCode Zen) / 5 min (Claude). The header's Refresh
+results are cached for 1 min (Codex) / 2 min (OpenCode Zen) / 10 min (Claude). The header's Refresh
 button forces a new read, at most every 15 s for Codex and every 2 min for
 Claude.
 
@@ -81,3 +81,8 @@ The folder is installed in place from Settings → Extensions. After an update
 that adds a capability (v2 adds the status section), OpenChamber asks for
 approval again there. `OPENCODE_CREDENTIAL_DB` overrides the database path for
 testing.
+
+Last readings and the Claude back-off are kept in
+`~/.cache/openchamber-accounts-usage/state.json` (mode 600, numbers and
+timestamps only, no tokens), so restarting the service doesn't blank the
+section or spend a request on a rate-limited account.
