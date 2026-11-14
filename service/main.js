@@ -37,8 +37,8 @@ const CODEX_METHODS = new Set(['chatgpt-browser', 'chatgpt-headless']);
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_ERROR_LENGTH = 2_000;
 // Anthropic rate-limits its usage endpoint hard; Codex is gentler.
-const CACHE_MS = { codex: 60_000, claude: 300_000 };
-const FORCE_FLOOR_MS = { codex: 0, claude: 120_000 };
+const CACHE_MS = { codex: 60_000, claude: 300_000, zen: 120_000 };
+const FORCE_FLOOR_MS = { codex: 0, claude: 120_000, zen: 15_000 };
 const FORCE_MIN_MS = 15_000;
 const CLAUDE_COOLDOWN_DEFAULT_MS = 5 * 60_000;
 const CLAUDE_COOLDOWN_MAX_MS = 60 * 60_000;
@@ -301,6 +301,122 @@ const fetchClaudeUsage = async (account) => {
   return { windows, credits: null, plan: account.plan };
 };
 
+// ---------------------------------------------------------------- OpenCode Zen
+
+const ZEN_API = 'https://opencode.ai/console/api';
+// Free models share one account-wide pool. OpenCode doesn't publish the size;
+// 50 requests per rolling 24 h is what its API enforced when tested 2026-11-14.
+const ZEN_FREE_DAILY_LIMIT = 50;
+const ZEN_PAGE_SIZE = 50;
+
+/** Console sign-ins (and API keys) saved on OpenCode's `opencode` integration. */
+const readZenAccounts = () => {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const rows = database.prepare(`
+      SELECT id, label, value, active FROM credential
+      WHERE integration_id = 'opencode'
+      ORDER BY active DESC, label COLLATE NOCASE, id
+    `).all();
+    const accounts = [];
+    for (const row of rows) {
+      let credential;
+      try {
+        credential = JSON.parse(String(row.value));
+      } catch {
+        continue;
+      }
+      const meta = credential?.metadata ?? {};
+      let token = '';
+      let orgID = null;
+      if (credential?.type === 'oauth' && typeof credential.access === 'string'
+        && String(meta.server ?? '').startsWith('https://opencode.ai/console')) {
+        token = credential.access;
+        orgID = typeof meta.orgID === 'string' ? meta.orgID : null;
+      } else if (credential?.type === 'api' && typeof credential.key === 'string') {
+        token = credential.key;
+      }
+      if (!token) continue;
+      accounts.push({
+        key: `zen:${row.id}`,
+        provider: 'zen',
+        label: String(meta.email || row.label || 'OpenCode'),
+        active: Boolean(row.active),
+        token,
+        orgID,
+      });
+    }
+    return accounts;
+  } finally {
+    database.close();
+  }
+};
+
+const zenJson = async (account, apiPath) => {
+  const response = await fetch(`${ZEN_API}${apiPath}`, {
+    headers: {
+      accept: 'application/json',
+      authorization: `Bearer ${account.token}`,
+      'x-opencode-session': 'accounts-usage',
+      ...(account.orgID ? { 'x-org-id': account.orgID } : {}),
+    },
+    // The token belongs to opencode.ai; never follow a redirect elsewhere.
+    redirect: 'error',
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (response.status === 401 || response.status === 403) {
+    throw new Error('Sign-in expired. Sign in to OpenCode again under Providers.');
+  }
+  if (!response.ok) throw new Error(`OpenCode Console answered HTTP ${response.status}`);
+  return response.json();
+};
+
+/** Sums one range of `/usage/models` into free requests and paid spend (USD). */
+const zenRange = async (account, range) => {
+  let free = 0;
+  let paidRequests = 0;
+  let paidMicroCents = 0;
+  for (let page = 1, pageCount = 1; page <= pageCount && page <= 20; page++) {
+    const payload = await zenJson(account, `/usage/models?range=${range}&page=${page}&pageSize=${ZEN_PAGE_SIZE}`);
+    if (!Array.isArray(payload?.items)) throw new Error('OpenCode Console usage could not be read');
+    pageCount = Number.isSafeInteger(payload.pageInfo?.pageCount) ? payload.pageInfo.pageCount : 1;
+    for (const item of payload.items) {
+      // The workspace can also serve OpenCode Go; only Zen rows count here.
+      if (item?.provider !== 'opencode') continue;
+      const requests = finiteNumber(item.totalRequests) ?? 0;
+      if (String(item.model ?? '').endsWith('-free')) free += requests;
+      else {
+        paidRequests += requests;
+        paidMicroCents += finiteNumber(item.totalCostMicroCents) ?? 0;
+      }
+    }
+  }
+  return { free, paidRequests, paidUsd: paidMicroCents / 100_000_000 };
+};
+
+const fetchZenUsage = async (account) => {
+  const [day, month] = await Promise.all([zenRange(account, '24h'), zenRange(account, '30d')]);
+  const windows = [{
+    label: 'Free requests',
+    sub: '24h',
+    usedPercent: Math.min(100, (day.free / ZEN_FREE_DAILY_LIMIT) * 100),
+    valueLabel: `${day.free} / ${ZEN_FREE_DAILY_LIMIT}`,
+    resetAt: null,
+    windowSeconds: 86400,
+  }];
+  if (month.paidRequests > 0) {
+    windows.push({
+      label: 'Paid',
+      sub: '30d',
+      usedPercent: null,
+      valueLabel: `$${month.paidUsd.toFixed(2)}`,
+      resetAt: null,
+      windowSeconds: 30 * 86400,
+    });
+  }
+  return { windows, credits: null, plan: null };
+};
+
 // ---------------------------------------------------------------- aggregation
 
 /** key → { at, result } — the last good reading per account. */
@@ -314,9 +430,8 @@ const readAccount = async (account, force) => {
   const ttl = force ? FORCE_FLOOR_MS[account.provider] : CACHE_MS[account.provider];
   if (cached && Date.now() - cached.at < ttl) return cached.result;
   try {
-    const usage = account.provider === 'codex'
-      ? await fetchCodexUsage(account)
-      : await fetchClaudeUsage(account);
+    const fetcher = { codex: fetchCodexUsage, claude: fetchClaudeUsage, zen: fetchZenUsage }[account.provider];
+    const usage = await fetcher(account);
     const result = { ...usage, error: null, updatedAt: Date.now() };
     cache.set(account.key, { at: Date.now(), result });
     return result;
@@ -340,6 +455,11 @@ const discover = () => {
     accounts.push(...readCodexAccounts());
   } catch (error) {
     problems.push(`Codex: could not read OpenCode accounts (${errorText(error)})`);
+  }
+  try {
+    accounts.push(...readZenAccounts());
+  } catch (error) {
+    problems.push(`OpenCode Zen: could not read OpenCode accounts (${errorText(error)})`);
   }
   return { accounts, problems };
 };

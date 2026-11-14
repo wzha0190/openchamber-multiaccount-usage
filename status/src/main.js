@@ -19,8 +19,10 @@ const ICONS = {
   // Generic glyphs (not provider logos): a terminal prompt for Codex, a spark for Claude.
   codex: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M4 6l6 6-6 6M12 18h8"/></svg>',
   claude: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2l1.9 6.1L20 10l-6.1 1.9L12 18l-1.9-6.1L4 10l6.1-1.9z"/></svg>',
+  // A plain square bracket pair for OpenCode.
+  zen: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 4H5v16h3M16 4h3v16h-3"/></svg>',
 };
-const PROVIDER_NAME = { codex: 'Codex', claude: 'Claude' };
+const PROVIDER_NAME = { codex: 'Codex', claude: 'Claude', zen: 'OpenCode Zen' };
 
 const el = (tag, className, text) => {
   const node = document.createElement(tag);
@@ -72,7 +74,7 @@ const render = () => {
   }
 
   // Claude first, then Codex, matching the Usage block's order; active first in each.
-  const order = ['claude', 'codex'];
+  const order = ['claude', 'codex', 'zen'];
   const sorted = [...accounts].sort((a, b) => (
     order.indexOf(a.provider) - order.indexOf(b.provider)
     || Number(b.active) - Number(a.active)
@@ -92,9 +94,10 @@ const render = () => {
     const body = el('div', 'body');
     for (const window of account.windows ?? []) {
       const percent = window.usedPercent;
-      const value = percent === null ? '—' : `${Math.round(percent)}%`;
+      const value = window.valueLabel ?? (percent === null ? '—' : `${Math.round(percent)}%`);
       const reset = window.resetAt ? new Date(window.resetAt).toLocaleString() : '';
-      body.append(metricRow(window.label, formatReset(window.resetAt), value, tone(percent), reset && `Resets ${reset}`));
+      const sub = window.sub ?? formatReset(window.resetAt);
+      body.append(metricRow(window.label, sub, value, tone(percent), reset && `Resets ${reset}`));
     }
     if (account.credits) body.append(metricRow('Credits', '', account.credits));
     if (account.stale && account.updatedAt) {

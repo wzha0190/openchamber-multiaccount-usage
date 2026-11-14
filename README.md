@@ -29,9 +29,18 @@ change to the extension:
   `CLAUDE_CONFIG_DIR=~/.claude-work claude` and run `/login`. The name comes
   from that directory's `.claude.json`.
 
+- **OpenCode Zen**: every OpenCode Console sign-in (or API key) saved on
+  OpenCode's `opencode` integration. Shows **Free requests** over the last
+  24 h against the shared free-model pool (50/day, the limit OpenCode's API
+  enforced when tested; it isn't published, so it's a constant in
+  `service/main.js`), and **Paid** spend over 30 days when there is any.
+  The pool is a rolling window with no reset time. Data comes from the
+  Console's undocumented `/usage/models` endpoint, the same one OpenChamber's
+  built-in Zen card reads.
+
 Percentages turn amber at 70 % and red at 90 %. Credits rows only appear when an
 account has a positive or unlimited balance. The section polls every minute;
-results are cached for 1 min (Codex) / 5 min (Claude). The header's Refresh
+results are cached for 1 min (Codex) / 2 min (OpenCode Zen) / 5 min (Claude). The header's Refresh
 button forces a new read, at most every 15 s for Codex and every 2 min for
 Claude.
 
