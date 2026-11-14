@@ -1,0 +1,496 @@
+// OpenChamber service for the "Accounts" Work Status section.
+//
+// Reads every saved account at request time, so a newly added account shows up
+// on the next refresh without touching the extension:
+//   - Codex: legacy ChatGPT browser/device-code logins in OpenCode's SQLite
+//     credential store (read-only).
+//   - Claude: Claude Code's default config dir (~/.claude) plus any
+//     ~/.claude-<name> dir holding a .credentials.json (CLAUDE_CONFIG_DIR logins).
+//
+// Tokens are used only as bearer credentials for the providers' usage
+// endpoints. They are never logged, returned to the UI, refreshed, or stored.
+//
+// Endpoints (all behind the service bearer):
+//   GET  /accounts            grouped usage for the Work Status section
+//   GET  /accounts?force=1    same, bypassing the short result cache
+//   POST /quota               OpenChamber quota-provider contract (Usage page card)
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
+const port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
+const serviceToken = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
+const home = process.env.HOME ?? '';
+const databasePath = process.env.OPENCODE_CREDENTIAL_DB
+  ?? path.join(home, '.local/share/opencode/opencode.db');
+
+if (!port || !serviceToken) {
+  console.error('OPENCHAMBER_SERVICE_PORT and OPENCHAMBER_SERVICE_TOKEN are required');
+  process.exit(1);
+}
+
+const CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const CLAUDE_OAUTH_BETA = 'oauth-2025-04-20';
+const CODEX_METHODS = new Set(['chatgpt-browser', 'chatgpt-headless']);
+const MAX_BODY_BYTES = 64 * 1024;
+const MAX_ERROR_LENGTH = 2_000;
+// Anthropic rate-limits its usage endpoint hard; Codex is gentler.
+const CACHE_MS = { codex: 60_000, claude: 300_000 };
+const FORCE_FLOOR_MS = { codex: 0, claude: 120_000 };
+const FORCE_MIN_MS = 15_000;
+const CLAUDE_COOLDOWN_DEFAULT_MS = 5 * 60_000;
+const CLAUDE_COOLDOWN_MAX_MS = 60 * 60_000;
+
+// ---------------------------------------------------------------- helpers
+
+const finiteNumber = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+};
+
+/** Seconds, milliseconds, or an ISO string → epoch ms. */
+const timestampMs = (value) => {
+  if (typeof value === 'string' && value && !/^\d+(\.\d+)?$/.test(value)) {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  const number = finiteNumber(value);
+  if (number === null || number < 0) return null;
+  return number < 10_000_000_000 ? Math.round(number * 1_000) : Math.round(number);
+};
+
+const readJson = (file) => {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+};
+
+const errorText = (error) => (error instanceof Error ? error.message : String(error));
+
+const windowLabel = (seconds, fallback) => {
+  if (seconds === 5 * 3600) return '5-Hour';
+  if (seconds === 7 * 86400) return 'Weekly';
+  if (seconds && seconds % 86400 === 0) return `${seconds / 86400}-Day`;
+  if (seconds && seconds % 3600 === 0) return `${seconds / 3600}-Hour`;
+  return fallback;
+};
+
+const makeWindow = (label, usedPercent, resetAt, windowSeconds) => ({
+  label,
+  usedPercent: usedPercent === null ? null : Math.max(0, usedPercent),
+  resetAt: resetAt ?? null,
+  windowSeconds: windowSeconds ?? null,
+});
+
+// ---------------------------------------------------------------- Codex
+
+const codexAccountIdFromToken = (token) => {
+  const encoded = String(token ?? '').split('.')[1];
+  if (!encoded) return null;
+  try {
+    const claims = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    return claims.chatgpt_account_id
+      ?? claims['https://api.openai.com/auth']?.chatgpt_account_id
+      ?? claims.organizations?.[0]?.id
+      ?? null;
+  } catch {
+    return null;
+  }
+};
+
+const readCodexAccounts = () => {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const rows = database.prepare(`
+      SELECT id, label, value, active
+      FROM credential
+      WHERE integration_id = 'openai'
+      ORDER BY active DESC, label COLLATE NOCASE, id
+    `).all();
+    const accounts = [];
+    for (const row of rows) {
+      let credential;
+      try {
+        credential = JSON.parse(String(row.value));
+      } catch {
+        continue;
+      }
+      if (credential?.type !== 'oauth' || !CODEX_METHODS.has(credential.methodID)) continue;
+      const access = typeof credential.access === 'string' ? credential.access : '';
+      if (!access) continue;
+      accounts.push({
+        key: `codex:${row.id}`,
+        provider: 'codex',
+        label: String(row.label || 'OpenAI account'),
+        active: Boolean(row.active),
+        access,
+        accountId: credential.metadata?.accountID ?? codexAccountIdFromToken(access),
+      });
+    }
+    return accounts;
+  } finally {
+    database.close();
+  }
+};
+
+const fetchCodexUsage = async (account) => {
+  const response = await fetch(CODEX_USAGE_URL, {
+    method: 'GET',
+    redirect: 'error',
+    headers: {
+      authorization: `Bearer ${account.access}`,
+      accept: 'application/json',
+      ...(account.accountId ? { 'ChatGPT-Account-Id': account.accountId } : {}),
+    },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (response.status === 401 || response.status === 403) {
+    throw new Error('Sign-in expired. Select this account under Providers and sign in again.');
+  }
+  if (!response.ok) throw new Error(`Usage service answered HTTP ${response.status}`);
+  const payload = await response.json();
+
+  const windows = [];
+  const addRate = (raw, fallback) => {
+    if (!raw) return;
+    const used = finiteNumber(raw.used_percent);
+    if (used === null) return;
+    const seconds = finiteNumber(raw.limit_window_seconds);
+    const resetAfter = finiteNumber(raw.reset_after_seconds);
+    const resetAt = timestampMs(raw.reset_at)
+      ?? (resetAfter !== null ? Date.now() + resetAfter * 1_000 : null);
+    windows.push(makeWindow(windowLabel(seconds, fallback), used, resetAt, seconds));
+  };
+  addRate(payload?.rate_limit?.primary_window, '5-Hour');
+  addRate(payload?.rate_limit?.secondary_window, 'Weekly');
+
+  // A zero balance on an account that never bought credits is noise.
+  const credits = payload?.credits;
+  const balance = finiteNumber(credits?.balance);
+  let creditsLabel = null;
+  if (credits?.unlimited) creditsLabel = 'Unlimited';
+  else if (balance !== null && balance > 0) creditsLabel = String(balance);
+
+  return {
+    windows,
+    credits: creditsLabel,
+    plan: typeof payload?.plan_type === 'string' ? payload.plan_type : null,
+  };
+};
+
+// ---------------------------------------------------------------- Claude
+
+/**
+ * Claude Code keeps one login per config dir. The default dir is what a plain
+ * `claude` uses, so it is the active one; others are `CLAUDE_CONFIG_DIR`
+ * logins named ~/.claude-<name>.
+ */
+const readClaudeAccounts = () => {
+  const candidates = [{ dir: path.join(home, '.claude'), profile: path.join(home, '.claude.json'), active: true }];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(home, { withFileTypes: true });
+  } catch {
+    entries = [];
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith('.claude-')) continue;
+    const dir = path.join(home, entry.name);
+    candidates.push({ dir, profile: path.join(dir, '.claude.json'), active: false });
+  }
+
+  const accounts = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const oauth = readJson(path.join(candidate.dir, '.credentials.json'))?.claudeAiOauth;
+    const access = typeof oauth?.accessToken === 'string' ? oauth.accessToken : '';
+    if (!access) continue;
+    const profile = readJson(candidate.profile)?.oauthAccount ?? {};
+    const identity = profile.accountUuid ?? profile.emailAddress ?? candidate.dir;
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    accounts.push({
+      key: `claude:${candidate.dir}`,
+      provider: 'claude',
+      label: String(profile.emailAddress || path.basename(candidate.dir).replace(/^\.claude-?/, '') || 'Claude'),
+      active: candidate.active,
+      access,
+      plan: typeof oauth.subscriptionType === 'string' ? oauth.subscriptionType : null,
+    });
+  }
+  return accounts;
+};
+
+/** key → { until, strikes }: back-off after consecutive 429s. */
+const claudeCooldowns = new Map();
+
+/**
+ * Anthropic answers 429 with `retry-after: 0` (observed 2026-11-14), so the
+ * header rarely helps. Back off 5 → 10 → 20 → 40 → 60 min on consecutive 429s,
+ * the same 5 min floor / 1 h cap Claude Code itself uses; reset on success.
+ */
+const cooldownFrom = (response, strikes) => {
+  const raw = response.headers.get('retry-after');
+  const seconds = raw === null ? null : finiteNumber(raw);
+  const backoff = Math.min(CLAUDE_COOLDOWN_DEFAULT_MS * 2 ** Math.max(0, strikes - 1), CLAUDE_COOLDOWN_MAX_MS);
+  const hinted = seconds !== null && seconds > 0 ? Math.min(seconds * 1_000, CLAUDE_COOLDOWN_MAX_MS) : 0;
+  return Math.max(backoff, hinted);
+};
+
+const fetchClaudeUsage = async (account) => {
+  const cooldown = claudeCooldowns.get(account.key);
+  if (cooldown && cooldown.until > Date.now()) {
+    throw Object.assign(new Error('Rate limited by Anthropic. Retrying soon.'), { keepLast: true });
+  }
+  // `skip_spend=1` is the lighter read Claude Code uses when it only needs the windows.
+  const response = await fetch(`${CLAUDE_USAGE_URL}?skip_spend=1`, {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${account.access}`,
+      'anthropic-beta': CLAUDE_OAUTH_BETA,
+      accept: 'application/json',
+    },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (response.status === 429) {
+    const strikes = (cooldown?.strikes ?? 0) + 1;
+    claudeCooldowns.set(account.key, { until: Date.now() + cooldownFrom(response, strikes), strikes });
+    throw Object.assign(new Error('Rate limited by Anthropic. Retrying soon.'), { keepLast: true });
+  }
+  claudeCooldowns.delete(account.key);
+  if (response.status === 401) {
+    throw new Error('Sign-in expired. Run Claude Code with this account to sign in again.');
+  }
+  if (response.status === 403) {
+    throw new Error('This Claude token cannot read usage. Sign in with Claude Code /login.');
+  }
+  if (!response.ok) throw new Error(`Anthropic answered HTTP ${response.status}`);
+  const payload = await response.json();
+
+  const windows = [];
+  const limits = Array.isArray(payload?.limits) ? payload.limits : [];
+  if (limits.length > 0) {
+    const scoped = [];
+    for (const limit of limits) {
+      const percent = finiteNumber(limit?.percent);
+      if (percent === null) continue;
+      const resetAt = timestampMs(limit.resets_at);
+      if (limit.kind === 'session') windows.push(makeWindow('5-Hour', percent, resetAt, 5 * 3600));
+      else if (limit.kind === 'weekly_all') windows.push(makeWindow('Weekly', percent, resetAt, 7 * 86400));
+      else if (limit.kind === 'weekly_scoped') {
+        const model = limit.scope?.model?.display_name;
+        if (typeof model === 'string' && model) {
+          scoped.push(makeWindow(`${model} · Weekly`, percent, resetAt, 7 * 86400));
+        }
+      }
+    }
+    windows.push(...scoped);
+  } else {
+    const fiveHour = payload?.five_hour;
+    const sevenDay = payload?.seven_day;
+    const fivePercent = finiteNumber(fiveHour?.utilization);
+    const sevenPercent = finiteNumber(sevenDay?.utilization);
+    if (fivePercent !== null) windows.push(makeWindow('5-Hour', fivePercent, timestampMs(fiveHour.resets_at), 5 * 3600));
+    if (sevenPercent !== null) windows.push(makeWindow('Weekly', sevenPercent, timestampMs(sevenDay.resets_at), 7 * 86400));
+  }
+  return { windows, credits: null, plan: account.plan };
+};
+
+// ---------------------------------------------------------------- aggregation
+
+/** key → { at, result } — the last good reading per account. */
+const cache = new Map();
+let pending = null;
+let lastForcedAt = 0;
+
+const readAccount = async (account, force) => {
+  const cached = cache.get(account.key);
+  // A forced refresh still keeps Claude at most one read per 2 min.
+  const ttl = force ? FORCE_FLOOR_MS[account.provider] : CACHE_MS[account.provider];
+  if (cached && Date.now() - cached.at < ttl) return cached.result;
+  try {
+    const usage = account.provider === 'codex'
+      ? await fetchCodexUsage(account)
+      : await fetchClaudeUsage(account);
+    const result = { ...usage, error: null, updatedAt: Date.now() };
+    cache.set(account.key, { at: Date.now(), result });
+    return result;
+  } catch (error) {
+    // A rate limit keeps the last good numbers on screen, marked stale; the
+    // section shows their age instead of an error.
+    if (error?.keepLast && cached) return { ...cached.result, error: null, stale: true };
+    return { windows: [], credits: null, plan: null, error: errorText(error), updatedAt: null };
+  }
+};
+
+const discover = () => {
+  const accounts = [];
+  const problems = [];
+  try {
+    accounts.push(...readClaudeAccounts());
+  } catch (error) {
+    problems.push(`Claude: ${errorText(error)}`);
+  }
+  try {
+    accounts.push(...readCodexAccounts());
+  } catch (error) {
+    problems.push(`Codex: could not read OpenCode accounts (${errorText(error)})`);
+  }
+  return { accounts, problems };
+};
+
+const collectUncoalesced = async (force) => {
+  const { accounts, problems } = discover();
+  const readings = await Promise.all(accounts.map(async (account) => {
+    const result = await readAccount(account, force);
+    return {
+      id: account.key,
+      provider: account.provider,
+      label: account.label,
+      active: account.active,
+      plan: result.plan ?? null,
+      windows: result.windows,
+      credits: result.credits,
+      error: result.error ? result.error.slice(0, 300) : null,
+      stale: Boolean(result.stale),
+      updatedAt: result.updatedAt,
+    };
+  }));
+  // Drop cached readings of accounts that no longer exist.
+  const live = new Set(accounts.map((account) => account.key));
+  for (const key of cache.keys()) if (!live.has(key)) cache.delete(key);
+  return { accounts: readings, problems, readAt: Date.now() };
+};
+
+const collect = (force = false) => {
+  if (force && Date.now() - lastForcedAt < FORCE_MIN_MS) force = false;
+  if (force) lastForcedAt = Date.now();
+  if (pending && !force) return pending;
+  const run = collectUncoalesced(force).finally(() => {
+    if (pending === run) pending = null;
+  });
+  pending = run;
+  return run;
+};
+
+// ---------------------------------------------------------------- quota card
+
+const shortName = (label) => (label.includes('@') ? label.split('@')[0] : label);
+
+const toQuotaData = async () => {
+  const { accounts, problems } = await collect();
+  const codex = accounts.filter((account) => account.provider === 'codex');
+  if (codex.length === 0) {
+    return {
+      ok: false,
+      configured: true,
+      error: (problems.join('; ') || 'No legacy Codex browser or device-code accounts are saved in OpenCode.').slice(0, MAX_ERROR_LENGTH),
+      usage: null,
+    };
+  }
+  const windows = {};
+  const failures = [];
+  let successCount = 0;
+  for (const account of codex) {
+    if (account.error && account.windows.length === 0) {
+      failures.push(`${shortName(account.label)}: ${account.error}`);
+      continue;
+    }
+    successCount += 1;
+    const name = `${shortName(account.label)}${account.active ? ' ●' : ''}`;
+    for (const window of account.windows) {
+      windows[`${name} · ${window.label}`] = {
+        usedPercent: window.usedPercent,
+        ...(window.windowSeconds ? { windowSeconds: window.windowSeconds } : {}),
+        ...(window.resetAt ? { resetAt: window.resetAt } : {}),
+      };
+    }
+    if (account.credits) windows[`${name} · Credits`] = { usedPercent: null, valueLabel: account.credits };
+  }
+  if (successCount === 0) {
+    return { ok: false, configured: true, error: failures.join('; ').slice(0, MAX_ERROR_LENGTH), usage: null };
+  }
+  return {
+    ok: true,
+    configured: true,
+    ...(failures.length ? { error: failures.join('; ').slice(0, MAX_ERROR_LENGTH) } : {}),
+    planLabel: `${successCount}/${codex.length} accounts`,
+    usage: { windows },
+  };
+};
+
+// ---------------------------------------------------------------- HTTP
+
+const readBody = (request) => new Promise((resolve, reject) => {
+  let body = '';
+  request.on('data', (chunk) => {
+    body += chunk;
+    if (body.length > MAX_BODY_BYTES) request.destroy(new Error('request body too large'));
+  });
+  request.on('end', () => resolve(body));
+  request.on('error', reject);
+});
+
+const validQuotaRequest = (body) => {
+  try {
+    const request = JSON.parse(body);
+    return request?.v === 1
+      && typeof request.requestId === 'string'
+      && request.requestId.length > 0
+      && request.method === 'usage.read'
+      && typeof request.provider === 'string'
+      && request.provider.length > 0
+      && request.input
+      && typeof request.input.credentials === 'object'
+      && !Array.isArray(request.input.credentials);
+  } catch {
+    return false;
+  }
+};
+
+const send = (response, status, body) => {
+  response.writeHead(status, { 'content-type': 'application/json' });
+  response.end(JSON.stringify(body));
+};
+
+const server = http.createServer((request, response) => {
+  if (request.headers.authorization !== `Bearer ${serviceToken}`) {
+    send(response, 401, { error: 'unauthorized' });
+    return;
+  }
+  const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+
+  if (url.pathname === '/health') {
+    send(response, 200, { ok: true });
+    return;
+  }
+
+  if (url.pathname === '/accounts' && request.method === 'GET') {
+    collect(url.searchParams.get('force') === '1')
+      .then((data) => send(response, 200, data))
+      .catch((error) => send(response, 500, { error: errorText(error).slice(0, MAX_ERROR_LENGTH) }));
+    return;
+  }
+
+  if (url.pathname === '/quota' && request.method === 'POST') {
+    readBody(request)
+      .then(async (body) => {
+        if (!validQuotaRequest(body)) {
+          send(response, 400, { ok: false, error: { message: 'not a supported usage request', status: 400 } });
+          return;
+        }
+        send(response, 200, { ok: true, data: await toQuotaData() });
+      })
+      .catch(() => send(response, 500, { ok: false, error: { message: 'could not read the request', status: 500 } }));
+    return;
+  }
+
+  send(response, 404, { error: 'not-found' });
+});
+
+server.listen(port, '127.0.0.1');

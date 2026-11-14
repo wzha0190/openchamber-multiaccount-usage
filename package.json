@@ -1,0 +1,35 @@
+{
+  "name": "openchamber-codex-multi-account-usage",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.7.1"
+    },
+    "contributes": {
+      "panel": {
+        "id": "codex-accounts-usage",
+        "name": "Codex Accounts",
+        "icon": "group"
+      },
+      "statusSection": {
+        "entry": "status/index.html",
+        "title": "Accounts",
+        "height": 260,
+        "defaultExpanded": true
+      },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host",
+        "provides": [
+          "quota"
+        ]
+      },
+      "quota": {
+        "providers": []
+      }
+    }
+  }
+}

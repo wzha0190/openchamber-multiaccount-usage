@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; }
+  body {
+    color: var(--oc-fg);
+    font-family: var(--oc-font, var(--font-sans, system-ui, sans-serif));
+    font-size: 1rem;
+    line-height: 1.45;
+    overflow: hidden;
+  }
+  #root { padding: 2px 0 4px; }
+  .acct + .acct { margin-top: 10px; }
+  .head { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 3px 0; }
+  .ic { width: 14px; height: 14px; flex: none; color: var(--oc-muted); display: inline-flex; }
+  .ic svg { width: 14px; height: 14px; }
+  .name { font-weight: 600; flex: none; }
+  .who { color: var(--oc-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .badge {
+    flex: none; font-size: 0.72em; font-weight: 500; line-height: 1.5;
+    padding: 0 6px; border-radius: 4px;
+    color: var(--oc-success-text, var(--oc-success));
+    background: color-mix(in srgb, var(--oc-success) 16%, transparent);
+  }
+  .body { padding-left: 22px; }
+  .row { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; min-width: 0; }
+  .lab { color: color-mix(in srgb, var(--oc-fg) 80%, transparent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .sub { color: var(--oc-muted); font-size: 0.85em; white-space: nowrap; flex: none; }
+  .val { margin-left: auto; padding-left: 8px; flex: none; font-variant-numeric: tabular-nums; color: color-mix(in srgb, var(--oc-fg) 85%, transparent); }
+  .val.warm { color: var(--oc-warning-text, var(--oc-warning)); }
+  .val.hot { color: var(--oc-error-text, var(--oc-error)); }
+  .note { color: var(--oc-muted); font-size: 0.85em; padding: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .note.bad { color: var(--oc-error-text, var(--oc-error)); }
+  .empty { color: var(--oc-muted); padding: 4px 0; }
+  .refresh {
+    margin-top: 8px; font: inherit; font-size: 0.85em; color: var(--oc-muted);
+    background: none; border: 0; padding: 0; cursor: pointer;
+  }
+  .refresh:hover { color: var(--oc-fg); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="main.js"></script>
+</body>
+</html>
