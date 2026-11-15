@@ -1,6 +1,6 @@
 {
-  "name": "openchamber-codex-multi-account-usage",
-  "version": "2.0.0",
+  "name": "openchamber-accounts-usage",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "openchamber": {
@@ -11,7 +11,7 @@
     "contributes": {
       "panel": {
         "id": "codex-accounts-usage",
-        "name": "Codex Accounts",
+        "name": "Accounts",
         "icon": "group"
       },
       "statusSection": {

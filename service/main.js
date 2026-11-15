@@ -396,12 +396,16 @@ const zenRange = async (account, range) => {
 
 const fetchZenUsage = async (account) => {
   const [day, month] = await Promise.all([zenRange(account, '24h'), zenRange(account, '30d')]);
+  // The Console's "24h" range is the current UTC day, not a rolling 24 h: on
+  // 2026-11-15 at 05:48 UTC it read 0 for requests made 14:00-16:30 UTC the day
+  // before. So the free pool resets at the next UTC midnight.
+  const now = new Date();
+  const nextUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
   const windows = [{
     label: 'Free requests',
-    sub: '24h',
     usedPercent: Math.min(100, (day.free / ZEN_FREE_DAILY_LIMIT) * 100),
     valueLabel: `${day.free} / ${ZEN_FREE_DAILY_LIMIT}`,
-    resetAt: null,
+    resetAt: nextUtcMidnight,
     windowSeconds: 86400,
   }];
   if (month.paidRequests > 0) {
@@ -544,35 +548,48 @@ const collect = (force = false) => {
 
 const shortName = (label) => (label.includes('@') ? label.split('@')[0] : label);
 
+const CARD_PROVIDER = { claude: 'Claude', codex: 'Codex', zen: 'Zen' };
+const CARD_WINDOWS_MAX = 32; // OpenChamber's quota schema bound
+
+/** The Usage-page card: every account's rows, named "Codex work · 5-Hour". */
 const toQuotaData = async () => {
   const { accounts, problems } = await collect();
-  const codex = accounts.filter((account) => account.provider === 'codex');
-  if (codex.length === 0) {
+  if (accounts.length === 0) {
     return {
       ok: false,
       configured: true,
-      error: (problems.join('; ') || 'No legacy Codex browser or device-code accounts are saved in OpenCode.').slice(0, MAX_ERROR_LENGTH),
+      error: (problems.join('; ') || 'No Codex, Claude or OpenCode Zen accounts are saved.').slice(0, MAX_ERROR_LENGTH),
       usage: null,
     };
   }
+  const order = ['claude', 'codex', 'zen'];
+  const sorted = [...accounts].sort((a, b) => (
+    order.indexOf(a.provider) - order.indexOf(b.provider) || Number(b.active) - Number(a.active)
+  ));
   const windows = {};
+  const add = (key, window) => {
+    if (Object.keys(windows).length < CARD_WINDOWS_MAX) windows[key] = window;
+  };
   const failures = [];
   let successCount = 0;
-  for (const account of codex) {
-    if (account.error && account.windows.length === 0) {
-      failures.push(`${shortName(account.label)}: ${account.error}`);
+  for (const account of sorted) {
+    const name = `${CARD_PROVIDER[account.provider]} ${shortName(account.label)}${account.active ? ' ●' : ''}`;
+    if (account.windows.length === 0) {
+      failures.push(`${name}: ${account.error ?? 'usage reads are rate-limited'}`);
       continue;
     }
     successCount += 1;
-    const name = `${shortName(account.label)}${account.active ? ' ●' : ''}`;
     for (const window of account.windows) {
-      windows[`${name} · ${window.label}`] = {
+      // A cached window that has reset since says nothing about now.
+      if (window.resetAt && window.resetAt <= Date.now()) continue;
+      add(`${name} · ${window.label}`, {
         usedPercent: window.usedPercent,
+        ...(window.valueLabel ? { valueLabel: window.valueLabel } : {}),
         ...(window.windowSeconds ? { windowSeconds: window.windowSeconds } : {}),
         ...(window.resetAt ? { resetAt: window.resetAt } : {}),
-      };
+      });
     }
-    if (account.credits) windows[`${name} · Credits`] = { usedPercent: null, valueLabel: account.credits };
+    if (account.credits) add(`${name} · Credits`, { usedPercent: null, valueLabel: account.credits });
   }
   if (successCount === 0) {
     return { ok: false, configured: true, error: failures.join('; ').slice(0, MAX_ERROR_LENGTH), usage: null };
@@ -581,7 +598,7 @@ const toQuotaData = async () => {
     ok: true,
     configured: true,
     ...(failures.length ? { error: failures.join('; ').slice(0, MAX_ERROR_LENGTH) } : {}),
-    planLabel: `${successCount}/${codex.length} accounts`,
+    planLabel: `${successCount}/${accounts.length} accounts`,
     usage: { windows },
   };
 };
