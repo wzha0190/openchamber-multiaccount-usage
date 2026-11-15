@@ -94,8 +94,13 @@ const render = () => {
     const body = el('div', 'body');
     for (const window of account.windows ?? []) {
       const percent = window.usedPercent;
-      const value = window.valueLabel ?? (percent === null ? '—' : `${Math.round(percent)}%`);
       const reset = window.resetAt ? new Date(window.resetAt).toLocaleString() : '';
+      // An old reading whose window has since reset says nothing about now.
+      if (window.resetAt && window.resetAt <= Date.now()) {
+        body.append(metricRow(window.label, 'reset', '—', '', `Reset ${reset}; waiting for a fresh reading`));
+        continue;
+      }
+      const value = window.valueLabel ?? (percent === null ? '—' : `${Math.round(percent)}%`);
       const sub = window.sub ?? formatReset(window.resetAt);
       body.append(metricRow(window.label, sub, value, tone(percent), reset && `Resets ${reset}`));
     }
@@ -105,7 +110,8 @@ const render = () => {
       + '(Claude Code, OpenChamber’s Claude card, other devices). This does not affect using Claude.';
     if (account.stale && account.updatedAt) {
       const minutes = Math.max(1, Math.round((Date.now() - account.updatedAt) / 60_000));
-      const note = el('div', 'note', `Updated ${minutes} min ago${nextTry}`);
+      const age = minutes < 90 ? `${minutes} min` : `${Math.round(minutes / 60)} h`;
+      const note = el('div', 'note', `Updated ${age} ago${nextTry}`);
       note.title = limitedTip;
       body.append(note);
     }
