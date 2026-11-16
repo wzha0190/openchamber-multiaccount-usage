@@ -176,9 +176,19 @@ const fetchCodexUsage = async (account) => {
   if (credits?.unlimited) creditsLabel = 'Unlimited';
   else if (balance !== null && balance > 0) creditsLabel = String(balance);
 
+  // Usage resets the account holds. `applicable_available_count` is how many
+  // can be used right now: 0 while under the limits, 1 once the account hit
+  // one (checked 2026-11-16 on a maxed and two unmaxed accounts). Undocumented.
+  const resetCredits = payload?.rate_limit_reset_credits;
+  const available = finiteNumber(resetCredits?.available_count);
+  const resets = available !== null && available > 0
+    ? { available, usable: Math.max(0, finiteNumber(resetCredits?.applicable_available_count) ?? 0) }
+    : null;
+
   return {
     windows,
     credits: creditsLabel,
+    resets,
     plan: typeof payload?.plan_type === 'string' ? payload.plan_type : null,
   };
 };
@@ -520,6 +530,7 @@ const collectUncoalesced = async (force) => {
       plan: result.plan ?? null,
       windows: result.windows,
       credits: result.credits,
+      resets: result.resets ?? null,
       error: result.error ? result.error.slice(0, 300) : null,
       stale: Boolean(result.stale),
       waiting: Boolean(result.waiting),

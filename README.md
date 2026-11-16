@@ -1,6 +1,6 @@
 # Accounts usage extension
 
-v2.1.0 (2026-11-15), OpenChamber ≥ 2.7.1.
+v2.2.0 (2026-11-16), OpenChamber ≥ 2.7.1.
 
 Adds an **Accounts** section to the chat's Work Status panel with one block per
 saved account, laid out like the built-in provider blocks:
@@ -22,7 +22,9 @@ change to the extension:
 - **Codex**: every legacy ChatGPT browser/device-code login saved by OpenCode
   (`~/.local/share/opencode/opencode.db`, opened read-only). The name shown is
   the label OpenCode stores for the credential; rename it under Providers.
-  The account OpenCode currently uses is marked *active*.
+  The account OpenCode currently uses is marked *active*. The header shows
+  the usage resets an account holds (`↺ 1`), in green as `↺ 1 usable` when
+  the account has hit its limit and a reset can be used.
 - **Claude**: Claude Code's default login (`~/.claude`, marked *active*) plus
   any `~/.claude-<name>` directory holding a `.credentials.json`. To add a
   second Claude account, sign in with

@@ -89,6 +89,15 @@ const render = () => {
     head.append(icon, el('span', 'name', PROVIDER_NAME[account.provider] ?? account.provider));
     head.append(el('span', 'who', `· ${shortName(account.label)}`));
     if (account.active) head.append(el('span', 'badge', 'active'));
+    if (account.resets) {
+      const { available, usable } = account.resets;
+      const resets = el('span', `resets ${usable > 0 ? 'usable' : ''}`.trim(), usable > 0 ? `↺ ${usable} usable` : `↺ ${available}`);
+      resets.title = `${available} usage reset${available === 1 ? '' : 's'} on this account. `
+        + (usable > 0
+          ? `${usable} can be used now, since the account has hit its limit.`
+          : 'A reset can only be used once the account hits its limit.');
+      head.append(resets);
+    }
     block.append(head);
 
     const body = el('div', 'body');

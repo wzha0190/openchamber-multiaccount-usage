@@ -24,6 +24,11 @@
     color: var(--oc-success-text, var(--oc-success));
     background: color-mix(in srgb, var(--oc-success) 16%, transparent);
   }
+  .resets {
+    margin-left: auto; padding-left: 8px; flex: none; font-size: 0.85em;
+    font-variant-numeric: tabular-nums; color: var(--oc-muted);
+  }
+  .resets.usable { color: var(--oc-success-text, var(--oc-success)); }
   .body { padding-left: 22px; }
   .row { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; min-width: 0; }
   .lab { color: color-mix(in srgb, var(--oc-fg) 80%, transparent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
