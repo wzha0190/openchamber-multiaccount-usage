@@ -9,7 +9,9 @@
     font-family: var(--oc-font, var(--font-sans, system-ui, sans-serif));
     font-size: 1rem;
     line-height: 1.45;
-    overflow: hidden;
+    /* The host clamps the frame to 480 px; taller content must scroll inside,
+       never clip (overflow: hidden here cut off whole account blocks). */
+    overflow-x: hidden;
   }
   #root { padding: 2px 0 4px; }
   .acct + .acct { margin-top: 10px; }
