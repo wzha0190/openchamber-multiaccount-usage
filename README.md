@@ -1,6 +1,6 @@
 # Accounts usage extension
 
-v2.3.0 (2026-11-16), OpenChamber ≥ 2.7.1.
+v2.4.0 (2026-11-16), OpenChamber ≥ 2.7.1.
 
 Adds an **Accounts** section to the chat's Work Status panel with one block per
 saved account, laid out like the built-in provider blocks:
@@ -52,10 +52,27 @@ change to the extension:
   providers counts toward the provider of its last model.
 
 Percentages turn amber at 70 % and red at 90 %. Credits rows only appear when an
-account has a positive or unlimited balance. The section polls every minute;
-results are cached for 1 min (Codex) / 2 min (OpenCode Zen) / 10 min (Claude). The header's Refresh
-button forces a new read, at most every 15 s for Codex and every 2 min for
-Claude.
+account has a positive or unlimited balance. ### Polling
+
+The service keeps running (`keepRunning`) and refreshes on its own every 30 s;
+each remote account is re-fetched only when its interval is due: Codex 2 min,
+OpenCode Zen 5 min, Claude's usage endpoint 10 min (30 min when reply data
+covers it). The section just reads the latest snapshot, so opening it or
+switching tabs never triggers a rescan. The header's Refresh button forces a
+new read (at most every 15 s for Codex, 2 min for Claude).
+
+### Claude without the usage endpoint
+
+Every Claude reply carries Anthropic's live window utilization in
+`anthropic-ratelimit-unified-*` response headers; Claude Code forwards them as
+a `rate_limit_event`, and OpenCode stores them on the assistant message as
+`native.rateLimit.unifiedWindows` (verified 2026-11-16). For the active Claude
+account the section reads the newest one straight from OpenCode's database —
+no request, no rate limit, exact as of the last reply. The usage endpoint then
+runs only as a backup and for per-model weekly rows (e.g. `Fable · Weekly`);
+its numbers are used only when fresher than the reply data. When reply data is
+over 15 min old (Claude hasn't been used since), the block notes "As of your
+last Claude reply" — those numbers don't move until you use that account again.
 
 Anthropic's usage endpoint has an unpublished per-account limit that every
 client reading it shares (Claude Code, OpenChamber's built-in Claude card, this

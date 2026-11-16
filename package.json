@@ -1,6 +1,6 @@
 {
   "name": "openchamber-accounts-usage",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "private": true,
   "type": "module",
   "openchamber": {
@@ -23,6 +23,7 @@
       "service": {
         "entry": "service/main.js",
         "runtime": "host",
+        "keepRunning": true,
         "provides": [
           "quota"
         ]

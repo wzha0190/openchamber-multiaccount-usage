@@ -37,7 +37,10 @@ const CODEX_METHODS = new Set(['chatgpt-browser', 'chatgpt-headless']);
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_ERROR_LENGTH = 2_000;
 // Anthropic rate-limits its usage endpoint hard; Codex is gentler.
-const CACHE_MS = { codex: 60_000, claude: 600_000, zen: 120_000, custom: 60_000 };
+// How often each account is re-read in the background. Codex and Zen are
+// remote calls; custom providers are local. Claude's endpoint interval applies
+// only when there is no saved reply data (see readClaude).
+const CACHE_MS = { codex: 120_000, claude: 600_000, zen: 300_000, custom: 30_000 };
 const FORCE_FLOOR_MS = { codex: 0, claude: 120_000, zen: 15_000, custom: 0 };
 const FORCE_MIN_MS = 15_000;
 const CLAUDE_COOLDOWN_DEFAULT_MS = 5 * 60_000;
@@ -593,10 +596,85 @@ const saveState = () => {
 
 loadState();
 
-const readAccount = async (account, force) => {
+// ---------------------------------------------------------------- Claude from saved replies
+
+/**
+ * Every Claude reply carries Anthropic's live window utilization in its
+ * `anthropic-ratelimit-unified-*` headers; Claude Code forwards them as a
+ * `rate_limit_event`, and OpenCode saves them on the assistant message as
+ * `native.rateLimit.unifiedWindows` (found 2026-11-16). Reading the newest one
+ * costs no request and is exact as of the last reply. It belongs to the login
+ * OpenCode's claude-agent uses, i.e. the default (active) Claude account.
+ */
+const readClaudeLocal = () => {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  let row;
+  try {
+    row = database.prepare(`
+      SELECT time_created AS at, json_extract(data, '$.native.rateLimit.unifiedWindows') AS windows
+      FROM session_message
+      WHERE type = 'assistant'
+        AND json_extract(data, '$.model.providerID') = 'claude-agent'
+        AND json_extract(data, '$.native.rateLimit.unifiedWindows') IS NOT NULL
+      ORDER BY time_created DESC
+      LIMIT 1
+    `).get();
+  } finally {
+    database.close();
+  }
+  if (!row) return null;
+  let raw;
+  try {
+    raw = JSON.parse(row.windows);
+  } catch {
+    return null;
+  }
+  const windows = [];
+  const add = (label, entry, seconds) => {
+    const utilization = finiteNumber(entry?.utilization);
+    if (utilization === null) return;
+    windows.push(makeWindow(label, utilization * 100, timestampMs(entry.resetsAt), seconds));
+  };
+  add('5-Hour', raw.five_hour, 5 * 3600);
+  add('Weekly', raw.seven_day, 7 * 86400);
+  return windows.length ? { at: Number(row.at), windows } : null;
+};
+
+/** With saved reply data at hand, the usage endpoint is only a backup. */
+const CLAUDE_ENDPOINT_BACKUP_MS = 30 * 60_000;
+const CLAUDE_LOCAL_STALE_MS = 15 * 60_000;
+
+const readClaude = async (account, force) => {
+  let local = null;
+  if (account.active) {
+    try {
+      local = readClaudeLocal();
+    } catch {
+      local = null;
+    }
+  }
+  const endpoint = await readAccount(account, force, local ? CLAUDE_ENDPOINT_BACKUP_MS : null);
+  if (!local) return endpoint;
+  const endpointAt = endpoint.stale ? 0 : (endpoint.updatedAt ?? 0);
+  if (endpointAt > local.at) return endpoint;
+  // Per-model weekly limits (e.g. "Fable · Weekly") only come from the endpoint.
+  const scoped = (endpoint.windows ?? []).filter((window) => window.label !== '5-Hour' && window.label !== 'Weekly');
+  return {
+    windows: [...local.windows, ...scoped],
+    credits: null,
+    plan: endpoint.plan ?? null,
+    error: null,
+    source: 'replies',
+    stale: Date.now() - local.at > CLAUDE_LOCAL_STALE_MS,
+    retryAt: null,
+    updatedAt: local.at,
+  };
+};
+
+const readAccount = async (account, force, ttlOverride = null) => {
   const cached = cache.get(account.key);
   // A forced refresh still keeps Claude at most one read per 2 min.
-  const ttl = force ? FORCE_FLOOR_MS[account.provider] : CACHE_MS[account.provider];
+  const ttl = force ? FORCE_FLOOR_MS[account.provider] : (ttlOverride ?? CACHE_MS[account.provider]);
   if (cached && Date.now() - cached.at < ttl) return cached.result;
   try {
     const fetcher = {
@@ -648,7 +726,9 @@ const discover = () => {
 const collectUncoalesced = async (force) => {
   const { accounts, problems } = discover();
   const readings = await Promise.all(accounts.map(async (account) => {
-    const result = await readAccount(account, force);
+    const result = account.provider === 'claude'
+      ? await readClaude(account, force)
+      : await readAccount(account, force);
     return {
       id: account.key,
       provider: account.provider,
@@ -666,6 +746,7 @@ const collectUncoalesced = async (force) => {
       stale: Boolean(result.stale),
       waiting: Boolean(result.waiting),
       retryAt: result.retryAt ?? null,
+      source: result.source ?? null,
       updatedAt: result.updatedAt,
     };
   }));
@@ -686,6 +767,29 @@ const collect = (force = false) => {
   return run;
 };
 
+// ---------------------------------------------------------------- background polling
+
+/**
+ * The service refreshes on its own: every tick it re-reads local data (saved
+ * Claude replies, custom-provider tokens) and fetches each remote account only
+ * when its CACHE_MS interval is due. Readers get the latest snapshot at once,
+ * so opening the section never starts a rescan. `keepRunning` in the manifest
+ * keeps this going while nobody is looking.
+ */
+const TICK_MS = 30_000;
+let snapshot = null;
+
+const refresh = (force = false) => collect(force).then((data) => {
+  snapshot = data;
+  return data;
+});
+
+/** The latest snapshot; waits only when there is none yet or a refresh is forced. */
+const current = (force = false) => (force || !snapshot ? refresh(force) : Promise.resolve(snapshot));
+
+refresh().catch(() => {});
+setInterval(() => refresh().catch(() => {}), TICK_MS);
+
 // ---------------------------------------------------------------- quota card
 
 const shortName = (label) => (label.includes('@') ? label.split('@')[0] : label);
@@ -695,7 +799,7 @@ const CARD_WINDOWS_MAX = 32; // OpenChamber's quota schema bound
 
 /** The Usage-page card: every account's rows, named "Codex work · 5-Hour". */
 const toQuotaData = async () => {
-  const { accounts, problems } = await collect();
+  const { accounts, problems } = await current();
   if (accounts.length === 0) {
     return {
       ok: false,
@@ -793,7 +897,7 @@ const server = http.createServer((request, response) => {
   }
 
   if (url.pathname === '/accounts' && request.method === 'GET') {
-    collect(url.searchParams.get('force') === '1')
+    current(url.searchParams.get('force') === '1')
       .then((data) => send(response, 200, data))
       .catch((error) => send(response, 500, { error: errorText(error).slice(0, MAX_ERROR_LENGTH) }));
     return;
