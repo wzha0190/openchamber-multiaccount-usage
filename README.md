@@ -1,6 +1,6 @@
 # Accounts usage extension
 
-v2.2.0 (2026-11-16), OpenChamber ≥ 2.7.1.
+v2.3.0 (2026-11-16), OpenChamber ≥ 2.7.1.
 
 Adds an **Accounts** section to the chat's Work Status panel with one block per
 saved account, laid out like the built-in provider blocks:
@@ -40,6 +40,16 @@ change to the extension:
   row shows the reset as the next UTC midnight. Data comes from the
   Console's undocumented `/usage/models` endpoint, the same one OpenChamber's
   built-in Zen card reads.
+
+- **Custom providers** (any other provider with a saved OpenCode credential,
+  e.g. an OpenAI-compatible endpoint): tracks **cost** instead of usage, since
+  such APIs rarely report spend. Cost is estimated from the token counts
+  OpenCode records per session × prices you set per 1M tokens in
+  `~/.config/openchamber-accounts-usage/config.json` (see
+  `config.example.json`; `reasoning` defaults to the output price, `hidden`
+  removes a provider). Without prices the block shows tokens and a note.
+  Totals run from the provider's first session. A session that switched
+  providers counts toward the provider of its last model.
 
 Percentages turn amber at 70 % and red at 90 %. Credits rows only appear when an
 account has a positive or unlimited balance. The section polls every minute;

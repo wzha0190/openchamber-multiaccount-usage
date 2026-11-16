@@ -37,8 +37,8 @@ const CODEX_METHODS = new Set(['chatgpt-browser', 'chatgpt-headless']);
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_ERROR_LENGTH = 2_000;
 // Anthropic rate-limits its usage endpoint hard; Codex is gentler.
-const CACHE_MS = { codex: 60_000, claude: 600_000, zen: 120_000 };
-const FORCE_FLOOR_MS = { codex: 0, claude: 120_000, zen: 15_000 };
+const CACHE_MS = { codex: 60_000, claude: 600_000, zen: 120_000, custom: 60_000 };
+const FORCE_FLOOR_MS = { codex: 0, claude: 120_000, zen: 15_000, custom: 0 };
 const FORCE_MIN_MS = 15_000;
 const CLAUDE_COOLDOWN_DEFAULT_MS = 5 * 60_000;
 const CLAUDE_COOLDOWN_MAX_MS = 60 * 60_000;
@@ -431,6 +431,126 @@ const fetchZenUsage = async (account) => {
   return { windows, credits: null, plan: null };
 };
 
+// ---------------------------------------------------------------- custom providers (cost)
+
+// Providers this extension already shows by usage, or that are OpenCode
+// built-ins; every other provider with a saved credential counts as custom.
+const NOT_CUSTOM = new Set(['openai', 'opencode', 'opencode-go', 'claude-agent', 'anthropic', 'claude']);
+const CONFIG_FILE = path.join(home, '.config', 'openchamber-accounts-usage', 'config.json');
+
+/**
+ * Prices live in the extension's config file, per 1M tokens:
+ *   { "customProviders": { "my-provider": { "name": "My Provider", "currency": "$",
+ *       "input": 0.3, "output": 1.2, "cacheRead": 0.03, "cacheWrite": 0.375,
+ *       "reasoning": 1.2, "hidden": false } } }
+ * `reasoning` defaults to the output price; missing prices count as unset.
+ */
+const readConfig = () => readJson(CONFIG_FILE) ?? {};
+
+const price = (value) => {
+  const number = finiteNumber(value);
+  return number !== null && number >= 0 ? number : null;
+};
+
+const compactTokens = (count) => {
+  if (count >= 1e9) return `${(count / 1e9).toFixed(1)}B`;
+  if (count >= 1e6) return `${(count / 1e6).toFixed(1)}M`;
+  if (count >= 1e3) return `${(count / 1e3).toFixed(1)}K`;
+  return String(count);
+};
+
+const readCustomAccounts = () => {
+  const settings = readConfig().customProviders ?? {};
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const rows = database.prepare(`
+      SELECT integration_id AS id, MAX(active) AS active FROM credential GROUP BY integration_id
+    `).all();
+    return rows
+      .filter((row) => !NOT_CUSTOM.has(row.id) && !settings[row.id]?.hidden)
+      .map((row) => ({
+        key: `custom:${row.id}`,
+        provider: 'custom',
+        integration: String(row.id),
+        label: String(settings[row.id]?.name || row.id),
+        active: false,
+      }));
+  } finally {
+    database.close();
+  }
+};
+
+/**
+ * Lifetime cost from OpenCode's own token counts. Sessions keep totals, not
+ * per-reply counts, and a session is attributed to the provider of its current
+ * model, so a session that switched providers counts wholly toward the last one.
+ */
+const fetchCustomUsage = async (account) => {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  let totals;
+  try {
+    totals = database.prepare(`
+      SELECT COUNT(*) AS sessions,
+             COALESCE(SUM(tokens_input), 0) AS input,
+             COALESCE(SUM(tokens_output), 0) AS output,
+             COALESCE(SUM(tokens_reasoning), 0) AS reasoning,
+             COALESCE(SUM(tokens_cache_read), 0) AS cacheRead,
+             COALESCE(SUM(tokens_cache_write), 0) AS cacheWrite,
+             MIN(time_created) AS since
+      FROM session_v2
+      WHERE json_extract(model, '$.providerID') = ?
+    `).get(account.integration);
+  } finally {
+    database.close();
+  }
+
+  const settings = readConfig().customProviders?.[account.integration] ?? {};
+  const prices = {
+    input: price(settings.input),
+    output: price(settings.output),
+    cacheRead: price(settings.cacheRead),
+    cacheWrite: price(settings.cacheWrite),
+  };
+  prices.reasoning = price(settings.reasoning) ?? prices.output;
+  const priced = prices.input !== null && prices.output !== null;
+  const cost = priced
+    ? (totals.input * prices.input
+      + totals.output * prices.output
+      + totals.reasoning * prices.reasoning
+      + totals.cacheRead * (prices.cacheRead ?? 0)
+      + totals.cacheWrite * (prices.cacheWrite ?? 0)) / 1e6
+    : null;
+  const currency = typeof settings.currency === 'string' && settings.currency ? settings.currency : '$';
+  const since = totals.since
+    ? new Date(totals.since).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+    : null;
+  const allTokens = totals.input + totals.output + totals.reasoning + totals.cacheRead + totals.cacheWrite;
+
+  return {
+    windows: [
+      {
+        label: 'Cost',
+        sub: since ? `since ${since}` : 'no use yet',
+        usedPercent: null,
+        valueLabel: cost === null ? '—' : `${currency}${cost < 10 ? cost.toFixed(2) : cost.toFixed(0)}`,
+        resetAt: null,
+        windowSeconds: null,
+      },
+      {
+        label: 'Tokens',
+        sub: `in ${compactTokens(totals.input)} · out ${compactTokens(totals.output + totals.reasoning)}`,
+        usedPercent: null,
+        valueLabel: compactTokens(allTokens),
+        resetAt: null,
+        windowSeconds: null,
+      },
+    ],
+    credits: null,
+    plan: null,
+    note: priced ? null : `Set ${account.label} prices in ~/.config/openchamber-accounts-usage/config.json`,
+  };
+};
+
 // ---------------------------------------------------------------- aggregation
 
 /** key → { at, result } — the last good reading per account. */
@@ -479,7 +599,9 @@ const readAccount = async (account, force) => {
   const ttl = force ? FORCE_FLOOR_MS[account.provider] : CACHE_MS[account.provider];
   if (cached && Date.now() - cached.at < ttl) return cached.result;
   try {
-    const fetcher = { codex: fetchCodexUsage, claude: fetchClaudeUsage, zen: fetchZenUsage }[account.provider];
+    const fetcher = {
+      codex: fetchCodexUsage, claude: fetchClaudeUsage, zen: fetchZenUsage, custom: fetchCustomUsage,
+    }[account.provider];
     const usage = await fetcher(account);
     const result = { ...usage, error: null, updatedAt: Date.now() };
     cache.set(account.key, { at: Date.now(), result });
@@ -515,6 +637,11 @@ const discover = () => {
   } catch (error) {
     problems.push(`OpenCode Zen: could not read OpenCode accounts (${errorText(error)})`);
   }
+  try {
+    accounts.push(...readCustomAccounts());
+  } catch (error) {
+    problems.push(`Custom providers: could not read OpenCode data (${errorText(error)})`);
+  }
   return { accounts, problems };
 };
 
@@ -531,6 +658,10 @@ const collectUncoalesced = async (force) => {
       windows: result.windows,
       credits: result.credits,
       resets: result.resets ?? null,
+      note: result.note ?? null,
+      pricedAs: account.provider === 'custom'
+        ? (readConfig().customProviders?.[account.integration]?.pricedAs ?? null)
+        : null,
       error: result.error ? result.error.slice(0, 300) : null,
       stale: Boolean(result.stale),
       waiting: Boolean(result.waiting),
@@ -559,7 +690,7 @@ const collect = (force = false) => {
 
 const shortName = (label) => (label.includes('@') ? label.split('@')[0] : label);
 
-const CARD_PROVIDER = { claude: 'Claude', codex: 'Codex', zen: 'Zen' };
+const CARD_PROVIDER = { claude: 'Claude', codex: 'Codex', zen: 'Zen', custom: '' };
 const CARD_WINDOWS_MAX = 32; // OpenChamber's quota schema bound
 
 /** The Usage-page card: every account's rows, named "Codex work · 5-Hour". */
@@ -573,7 +704,7 @@ const toQuotaData = async () => {
       usage: null,
     };
   }
-  const order = ['claude', 'codex', 'zen'];
+  const order = ['claude', 'codex', 'zen', 'custom'];
   const sorted = [...accounts].sort((a, b) => (
     order.indexOf(a.provider) - order.indexOf(b.provider) || Number(b.active) - Number(a.active)
   ));
@@ -584,7 +715,8 @@ const toQuotaData = async () => {
   const failures = [];
   let successCount = 0;
   for (const account of sorted) {
-    const name = `${CARD_PROVIDER[account.provider]} ${shortName(account.label)}${account.active ? ' ●' : ''}`;
+    const name = [CARD_PROVIDER[account.provider], shortName(account.label)].filter(Boolean).join(' ')
+      + (account.active ? ' ●' : '');
     if (account.windows.length === 0) {
       failures.push(`${name}: ${account.error ?? 'usage reads are rate-limited'}`);
       continue;

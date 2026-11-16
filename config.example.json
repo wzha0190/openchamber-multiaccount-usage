@@ -1,0 +1,14 @@
+{
+  "customProviders": {
+    "my-provider": {
+      "name": "My Provider",
+      "currency": "$",
+      "pricedAs": "where these prices come from (shown on hover)",
+      "input": 0.20,
+      "output": 0.50,
+      "cacheRead": 0.05,
+      "cacheWrite": 0.20
+    },
+    "provider-to-hide": { "hidden": true }
+  }
+}

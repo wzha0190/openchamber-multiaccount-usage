@@ -22,6 +22,7 @@ const ICONS = {
   // A plain square bracket pair for OpenCode.
   zen: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M8 4H5v16h3M16 4h3v16h-3"/></svg>',
 };
+ICONS.custom = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M14.5 9.5c-.5-1-1.4-1.5-2.5-1.5-1.4 0-2.5.8-2.5 2s1.1 1.6 2.5 2 2.5.8 2.5 2-1.1 2-2.5 2c-1.1 0-2-.5-2.5-1.5M12 6.5V8m0 8v1.5"/></svg>';
 const PROVIDER_NAME = { codex: 'Codex', claude: 'Claude', zen: 'OpenCode Zen' };
 
 const el = (tag, className, text) => {
@@ -74,7 +75,7 @@ const render = () => {
   }
 
   // Claude first, then Codex, matching the Usage block's order; active first in each.
-  const order = ['claude', 'codex', 'zen'];
+  const order = ['claude', 'codex', 'zen', 'custom'];
   const sorted = [...accounts].sort((a, b) => (
     order.indexOf(a.provider) - order.indexOf(b.provider)
     || Number(b.active) - Number(a.active)
@@ -86,8 +87,13 @@ const render = () => {
     head.title = account.label;
     const icon = el('span', 'ic');
     icon.innerHTML = ICONS[account.provider] ?? '';
-    head.append(icon, el('span', 'name', PROVIDER_NAME[account.provider] ?? account.provider));
-    head.append(el('span', 'who', `· ${shortName(account.label)}`));
+    if (account.provider === 'custom') {
+      // A custom provider is named by itself; there's no separate account name.
+      head.append(icon, el('span', 'name', account.label));
+    } else {
+      head.append(icon, el('span', 'name', PROVIDER_NAME[account.provider] ?? account.provider));
+      head.append(el('span', 'who', `· ${shortName(account.label)}`));
+    }
     if (account.active) head.append(el('span', 'badge', 'active'));
     if (account.resets) {
       const { available, usable } = account.resets;
@@ -111,9 +117,12 @@ const render = () => {
       }
       const value = window.valueLabel ?? (percent === null ? '—' : `${Math.round(percent)}%`);
       const sub = window.sub ?? formatReset(window.resetAt);
-      body.append(metricRow(window.label, sub, value, tone(percent), reset && `Resets ${reset}`));
+      const tip = reset ? `Resets ${reset}`
+        : (window.label === 'Cost' && account.pricedAs ? `Estimated from OpenCode's token counts, priced as ${account.pricedAs}` : '');
+      body.append(metricRow(window.label, sub, value, tone(percent), tip));
     }
     if (account.credits) body.append(metricRow('Credits', '', account.credits));
+    if (account.note) body.append(el('div', 'note', account.note));
     const nextTry = account.retryAt ? ` · next try ${formatReset(account.retryAt)}` : '';
     const limitedTip = 'Anthropic limits how often an account’s usage can be read, shared by every app that reads it '
       + '(Claude Code, OpenChamber’s Claude card, other devices). This does not affect using Claude.';
