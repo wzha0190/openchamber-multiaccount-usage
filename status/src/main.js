@@ -128,14 +128,13 @@ const render = () => {
     const nextTry = account.retryAt ? ` · next try ${formatReset(account.retryAt)}` : '';
     const limitedTip = 'Anthropic limits how often an account’s usage can be read, shared by every app that reads it '
       + '(Claude Code, OpenChamber’s Claude card, other devices). This does not affect using Claude.';
-    if (account.stale && account.updatedAt) {
+    // Numbers from saved Claude replies need no age note (the user asked for
+    // it gone); endpoint readings keep theirs, it signals rate limiting.
+    if (account.stale && account.updatedAt && account.source !== 'replies') {
       const minutes = Math.max(1, Math.round((Date.now() - account.updatedAt) / 60_000));
       const age = minutes < 90 ? `${minutes} min` : `${Math.round(minutes / 60)} h`;
-      const fromReplies = account.source === 'replies';
-      const note = el('div', 'note', fromReplies ? `As of your last Claude reply, ${age} ago` : `Updated ${age} ago${nextTry}`);
-      note.title = fromReplies
-        ? 'Read from the usage Anthropic reports with every Claude reply. It updates the next time you use Claude.'
-        : limitedTip;
+      const note = el('div', 'note', `Updated ${age} ago${nextTry}`);
+      note.title = limitedTip;
       body.append(note);
     }
     if (account.waiting) {
