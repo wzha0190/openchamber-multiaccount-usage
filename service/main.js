@@ -624,17 +624,50 @@ const fetchCustomUsage = async (account) => {
     database.close();
   }
 
+  // Ledgers from before v2.5.1 recorded replies while they were still
+  // streaming (tokens 0 or partial) and never revisited them. Lift each total
+  // to at least what the rows still present since the ledger began add up to.
+  if (previous && !ledger.completedOnly && ledger.since !== null) {
+    const repairDb = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const sums = repairDb.prepare(`
+        SELECT count(*) AS replies,
+               SUM(COALESCE(json_extract(data, '$.tokens.input'), 0)) AS input,
+               SUM(COALESCE(json_extract(data, '$.tokens.output'), 0)) AS output,
+               SUM(COALESCE(json_extract(data, '$.tokens.reasoning'), 0)) AS reasoning,
+               SUM(COALESCE(json_extract(data, '$.tokens.cache.read'), 0)) AS cacheRead,
+               SUM(COALESCE(json_extract(data, '$.tokens.cache.write'), 0)) AS cacheWrite
+        FROM session_message
+        WHERE type = 'assistant'
+          AND json_extract(data, '$.model.providerID') = ?
+          AND json_extract(data, '$.time.completed') IS NOT NULL
+          AND time_created >= ? AND time_created <= ?
+      `).get(account.integration, ledger.since, ledger.lastAt);
+      for (const key of ['replies', 'input', 'output', 'reasoning', 'cacheRead', 'cacheWrite']) {
+        ledger[key] = Math.max(ledger[key] ?? 0, Number(sums?.[key]) || 0);
+      }
+    } finally {
+      repairDb.close();
+    }
+  }
+  ledger.completedOnly = true;
+
+  // A reply's tokens are final only once OpenCode stamps `time.completed`.
+  // Stop at the first unfinished one so the cursor never skips past it; one
+  // left unfinished for over an hour (crashed run) is taken as it stands.
+  const STALE_UNFINISHED_MS = 60 * 60 * 1000;
   for (const row of rows) {
     if (row.at === ledger.lastAt && ledger.lastIds.includes(row.id)) continue;
-    if (row.at > ledger.lastAt) {
-      ledger.lastAt = row.at;
-      ledger.lastIds = [];
-    }
     let message;
     try {
       message = JSON.parse(row.data);
     } catch {
       continue;
+    }
+    if (message?.time?.completed == null && Date.now() - row.at < STALE_UNFINISHED_MS) break;
+    if (row.at > ledger.lastAt) {
+      ledger.lastAt = row.at;
+      ledger.lastIds = [];
     }
     const tokens = message?.tokens ?? {};
     const replyTokens = Math.max(0, finiteNumber(tokens.input) ?? 0)
