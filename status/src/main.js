@@ -63,6 +63,7 @@ const metricRow = (label, sub, value, toneClass, title) => {
 };
 
 const render = () => {
+  root.classList.remove('compact');
   root.replaceChildren();
 
   if (!lastData) {
@@ -160,6 +161,9 @@ const render = () => {
     refresh.addEventListener('click', () => load(true));
     root.append(refresh);
   }
+  // OpenChamber clamps status frames to 480 px. Compact only long lists so
+  // today's accounts fit; keep normal host typography when the list is short.
+  if (root.getBoundingClientRect().height > 480) root.classList.add('compact');
   fit();
 };
 

@@ -46,6 +46,16 @@
     background: none; border: 0; padding: 0; cursor: pointer;
   }
   .refresh:hover { color: var(--oc-fg); }
+  /* Automatically enabled when the natural account list is taller than the
+     host's 480 px status-section cap. Short lists keep the host's normal size. */
+  #root.compact { font-size: 0.88em; line-height: 1.36; }
+  #root.compact .acct + .acct { margin-top: 5px; }
+  #root.compact .head { gap: 6px; padding: 2px 0; }
+  #root.compact .body { padding-left: 20px; }
+  #root.compact .row { gap: 6px; padding: 1px 0; }
+  #root.compact .val { padding-left: 5px; }
+  #root.compact .resets { padding-left: 5px; }
+  #root.compact .note { padding: 1px 0; }
 </style>
 </head>
 <body>
