@@ -113,7 +113,7 @@ const readCodexAccounts = () => {
       SELECT id, label, value, active
       FROM credential
       WHERE integration_id = 'openai'
-      ORDER BY active DESC, label COLLATE NOCASE, id
+      ORDER BY label COLLATE NOCASE, id
     `).all();
     const accounts = [];
     for (const row of rows) {
@@ -329,7 +329,7 @@ const readZenAccounts = () => {
     const rows = database.prepare(`
       SELECT id, label, value, active FROM credential
       WHERE integration_id = 'opencode'
-      ORDER BY active DESC, label COLLATE NOCASE, id
+      ORDER BY label COLLATE NOCASE, id
     `).all();
     const accounts = [];
     for (const row of rows) {
@@ -861,7 +861,8 @@ const toQuotaData = async () => {
   }
   const order = ['claude', 'codex', 'zen', 'custom'];
   const sorted = [...accounts].sort((a, b) => (
-    order.indexOf(a.provider) - order.indexOf(b.provider) || Number(b.active) - Number(a.active)
+    order.indexOf(a.provider) - order.indexOf(b.provider)
+    || a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' })
   ));
   const windows = {};
   const add = (key, window) => {

@@ -77,11 +77,12 @@ const render = () => {
     root.append(el('div', 'empty', 'No Codex or Claude accounts found.'));
   }
 
-  // Claude first, then Codex, matching the Usage block's order; active first in each.
+  // Keep account positions stable. Only the active badge moves when OpenCode
+  // switches credentials; moving the whole row made percentages look erratic.
   const order = ['claude', 'codex', 'zen', 'custom'];
   const sorted = [...accounts].sort((a, b) => (
     order.indexOf(a.provider) - order.indexOf(b.provider)
-    || Number(b.active) - Number(a.active)
+    || a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' })
   ));
 
   for (const account of sorted) {
