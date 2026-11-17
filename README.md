@@ -44,20 +44,23 @@ change to the extension:
 - **Custom providers** (any other provider with a saved OpenCode credential,
   e.g. an OpenAI-compatible endpoint): tracks **cost** instead of usage, since
   such APIs rarely report spend. Cost is estimated from the token counts
-  OpenCode records per session × prices you set per 1M tokens in
+  OpenCode records on each immutable assistant reply × prices you set per 1M tokens in
   `~/.config/openchamber-accounts-usage/config.json` (see
   `config.example.json`; `reasoning` defaults to the output price, `hidden`
   removes a provider). Without prices the block shows tokens and a note.
-  Totals run from the provider's first session. A session that switched
-  providers counts toward the provider of its last model.
+  Totals run from the provider's first saved reply. The service appends every
+  unseen API reply's actual returned token usage to its own persistent ledger;
+  it never subtracts usage, even after OpenCode compacts or prunes that reply.
+  The provider has no billing endpoint, so dollars are an estimate from this
+  endpoint-usage ledger × the configured equivalent-model prices.
 
 Percentages turn amber at 70 % and red at 90 %. Credits rows only appear when an
 account has a positive or unlimited balance. ### Polling
 
-The service keeps running (`keepRunning`) and refreshes on its own every 30 s;
-each remote account is re-fetched only when its interval is due: Codex 2 min,
-OpenCode Zen 5 min, Claude's usage endpoint 10 min (30 min when reply data
-covers it). The section just reads the latest snapshot, so opening it or
+The service keeps running (`keepRunning`) and scans local reply usage every
+10 s. Each remote account is re-fetched only when its interval is due: Codex
+2 min, OpenCode Zen 5 min, Claude's usage endpoint 10 min (30 min when reply
+data covers it). The section just reads the latest snapshot, so opening it or
 switching tabs never triggers a rescan. The header's Refresh button forces a
 new read (at most every 15 s for Codex, 2 min for Claude).
 

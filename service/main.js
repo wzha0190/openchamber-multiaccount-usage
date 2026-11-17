@@ -40,7 +40,7 @@ const MAX_ERROR_LENGTH = 2_000;
 // How often each account is re-read in the background. Codex and Zen are
 // remote calls; custom providers are local. Claude's endpoint interval applies
 // only when there is no saved reply data (see readClaude).
-const CACHE_MS = { codex: 120_000, claude: 600_000, zen: 300_000, custom: 30_000 };
+const CACHE_MS = { codex: 120_000, claude: 600_000, zen: 300_000, custom: 10_000 };
 const FORCE_FLOOR_MS = { codex: 0, claude: 120_000, zen: 15_000, custom: 0 };
 const FORCE_MIN_MS = 15_000;
 const CLAUDE_COOLDOWN_DEFAULT_MS = 5 * 60_000;
@@ -484,28 +484,65 @@ const readCustomAccounts = () => {
 };
 
 /**
- * Lifetime cost from OpenCode's own token counts. Sessions keep totals, not
- * per-reply counts, and a session is attributed to the provider of its current
- * model, so a session that switched providers counts wholly toward the last one.
+ * Append unseen endpoint replies to the extension's own lifetime ledger.
+ * Each assistant message contains the API response's actual `tokens` usage.
+ * Once added, usage stays in our ledger even if OpenCode compacts or prunes the
+ * message later. This is not a sum of OpenCode's mutable session snapshots.
  */
 const fetchCustomUsage = async (account) => {
   const database = new DatabaseSync(databasePath, { readOnly: true });
-  let totals;
+  const previous = customLedgers.get(account.integration);
+  const ledger = previous
+    ? { ...previous, lastIds: [...(previous.lastIds ?? [])] }
+    : {
+        replies: 0,
+        input: 0,
+        output: 0,
+        reasoning: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        since: null,
+        lastAt: 0,
+        lastIds: [],
+      };
+  let rows;
   try {
-    totals = database.prepare(`
-      SELECT COUNT(*) AS sessions,
-             COALESCE(SUM(tokens_input), 0) AS input,
-             COALESCE(SUM(tokens_output), 0) AS output,
-             COALESCE(SUM(tokens_reasoning), 0) AS reasoning,
-             COALESCE(SUM(tokens_cache_read), 0) AS cacheRead,
-             COALESCE(SUM(tokens_cache_write), 0) AS cacheWrite,
-             MIN(time_created) AS since
-      FROM session_v2
-      WHERE json_extract(model, '$.providerID') = ?
-    `).get(account.integration);
+    rows = database.prepare(`
+      SELECT id, time_created AS at, data
+      FROM session_message
+      WHERE type = 'assistant'
+        AND json_extract(data, '$.model.providerID') = ?
+        AND time_created >= ?
+      ORDER BY time_created, id
+    `).all(account.integration, ledger.lastAt);
   } finally {
     database.close();
   }
+
+  for (const row of rows) {
+    if (row.at === ledger.lastAt && ledger.lastIds.includes(row.id)) continue;
+    if (row.at > ledger.lastAt) {
+      ledger.lastAt = row.at;
+      ledger.lastIds = [];
+    }
+    let message;
+    try {
+      message = JSON.parse(row.data);
+    } catch {
+      continue;
+    }
+    const tokens = message?.tokens ?? {};
+    ledger.input += Math.max(0, finiteNumber(tokens.input) ?? 0);
+    ledger.output += Math.max(0, finiteNumber(tokens.output) ?? 0);
+    ledger.reasoning += Math.max(0, finiteNumber(tokens.reasoning) ?? 0);
+    ledger.cacheRead += Math.max(0, finiteNumber(tokens.cache?.read) ?? 0);
+    ledger.cacheWrite += Math.max(0, finiteNumber(tokens.cache?.write) ?? 0);
+    ledger.replies += 1;
+    ledger.since = ledger.since === null ? row.at : Math.min(ledger.since, row.at);
+    ledger.lastIds.push(row.id);
+  }
+  customLedgers.set(account.integration, ledger);
+  const totals = ledger;
 
   const settings = readConfig().customProviders?.[account.integration] ?? {};
   const prices = {
@@ -535,7 +572,7 @@ const fetchCustomUsage = async (account) => {
         label: 'Cost',
         sub: since ? `since ${since}` : 'no use yet',
         usedPercent: null,
-        valueLabel: cost === null ? '—' : `${currency}${cost < 10 ? cost.toFixed(2) : cost.toFixed(0)}`,
+        valueLabel: cost === null ? '—' : `${currency}${cost.toFixed(2)}`,
         resetAt: null,
         windowSeconds: null,
       },
@@ -558,13 +595,16 @@ const fetchCustomUsage = async (account) => {
 
 /** key → { at, result } — the last good reading per account. */
 const cache = new Map();
+/** provider id → append-only endpoint-usage ledger and message cursor. */
+const customLedgers = new Map();
 let pending = null;
 let lastForcedAt = 0;
 
 // Last readings and Claude back-off survive a service restart (OpenChamber
 // stops idle services and restarts them on pause/resume), so a restart neither
 // blanks the section nor spends a fresh request on a rate-limited account.
-// Holds usage numbers and timestamps only, never tokens.
+// Holds usage numbers, aggregate custom-provider token totals and timestamps;
+// never credentials, message content or per-reply data.
 const STATE_FILE = path.join(home, '.cache', 'openchamber-accounts-usage', 'state.json');
 const STATE_MAX_AGE_MS = 24 * 3600 * 1000;
 
@@ -573,10 +613,16 @@ const loadState = () => {
   if (!state) return;
   const now = Date.now();
   for (const [key, entry] of Object.entries(state.cache ?? {})) {
+    // Rebuild custom-provider display rows from the append-only ledger on every
+    // start; never show a cached result from the old mutable-session scheme.
+    if (key.startsWith('custom:')) continue;
     if (entry && typeof entry.at === 'number' && now - entry.at < STATE_MAX_AGE_MS) cache.set(key, entry);
   }
   for (const [key, entry] of Object.entries(state.cooldowns ?? {})) {
     if (entry && typeof entry.until === 'number' && entry.until > now) claudeCooldowns.set(key, entry);
+  }
+  for (const [key, entry] of Object.entries(state.customLedgers ?? {})) {
+    if (entry && typeof entry === 'object') customLedgers.set(key, entry);
   }
 };
 
@@ -587,6 +633,7 @@ const saveState = () => {
     fs.writeFileSync(temp, JSON.stringify({
       cache: Object.fromEntries(cache),
       cooldowns: Object.fromEntries(claudeCooldowns),
+      customLedgers: Object.fromEntries(customLedgers),
     }), { mode: 0o600 });
     fs.renameSync(temp, STATE_FILE);
   } catch {
@@ -759,7 +806,9 @@ const collectUncoalesced = async (force) => {
 const collect = (force = false) => {
   if (force && Date.now() - lastForcedAt < FORCE_MIN_MS) force = false;
   if (force) lastForcedAt = Date.now();
-  if (pending && !force) return pending;
+  // Never overlap collectors: two custom-provider scans must not append the
+  // same API reply twice.
+  if (pending) return pending;
   const run = collectUncoalesced(force).finally(() => {
     if (pending === run) pending = null;
   });
@@ -776,7 +825,9 @@ const collect = (force = false) => {
  * so opening the section never starts a rescan. `keepRunning` in the manifest
  * keeps this going while nobody is looking.
  */
-const TICK_MS = 30_000;
+// Local reply-ledger scans are cheap and run every 10 s. Remote providers keep
+// their longer CACHE_MS intervals, so this does not increase API polling.
+const TICK_MS = 10_000;
 let snapshot = null;
 
 const refresh = (force = false) => collect(force).then((data) => {
