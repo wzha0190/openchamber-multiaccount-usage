@@ -1,4 +1,5 @@
 {
+  "_comment": "Optional. Providers without prices are priced automatically from the models.dev catalog that OpenCode caches; config entries override it.",
   "customProviders": {
     "my-provider": {
       "name": "My Provider",

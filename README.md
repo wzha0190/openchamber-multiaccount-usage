@@ -44,10 +44,16 @@ change to the extension:
 - **Custom providers** (any other provider with a saved OpenCode credential,
   e.g. an OpenAI-compatible endpoint): tracks **cost** instead of usage, since
   such APIs rarely report spend. Cost is estimated from the token counts
-  OpenCode records on each immutable assistant reply × prices you set per 1M tokens in
-  `~/.config/openchamber-accounts-usage/config.json` (see
+  OpenCode records on each immutable assistant reply × prices per 1M tokens.
+  Prices come from `~/.config/openchamber-accounts-usage/config.json` (see
   `config.example.json`; `reasoning` defaults to the output price, `hidden`
-  removes a provider). Without prices the block shows tokens and a note.
+  removes a provider) and otherwise fall back to the **models.dev catalog**,
+  which OpenCode caches in its own database and keeps fresh from the cloud:
+  the reply's most-used model id is matched against catalog ids by longest
+  prefix, so quantised/variant names price as their base model (the hover
+  says which catalog entry was used). Only if neither has a price does the
+  block show tokens plus a note. A new machine therefore needs no config for
+  well-known models.
   Totals run from the provider's first saved reply. The service appends every
   unseen API reply's actual returned token usage to its own persistent ledger;
   it never subtracts usage, even after OpenCode compacts or prunes that reply.

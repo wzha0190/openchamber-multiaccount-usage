@@ -455,6 +455,94 @@ const price = (value) => {
   return number !== null && number >= 0 ? number : null;
 };
 
+/**
+ * OpenCode keeps the full models.dev price catalog in its `kv` table and
+ * refreshes it from the cloud itself. Custom providers with no configured
+ * prices are priced from it, so a new machine needs no config file for
+ * well-known models.
+ */
+const CATALOG_KEY = 'models-dev:v2:catalog';
+let catalogCache = { digest: null, models: null };
+
+const loadCatalog = () => {
+  let head;
+  let full;
+  try {
+    const database = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      // Read only the header first; re-parse the ~12 MB body only when the
+      // digest changed.
+      head = database.prepare('SELECT substr(value, 1, 200) AS head FROM kv WHERE key = ?').get(CATALOG_KEY);
+      if (!head) return catalogCache.models;
+      const digest = /"digest":"([^"]+)"/.exec(head.head)?.[1] ?? null;
+      if (catalogCache.models && digest === catalogCache.digest) return catalogCache.models;
+      full = database.prepare('SELECT value FROM kv WHERE key = ?').get(CATALOG_KEY).value;
+    } finally {
+      database.close();
+    }
+  } catch {
+    // No kv table (older OpenCode) or unreadable: keep whatever we had.
+    return catalogCache.models;
+  }
+  const models = new Map();
+  try {
+    const body = JSON.parse(JSON.parse(full).body);
+    for (const [providerId, provider] of Object.entries(body)) {
+      for (const [modelId, model] of Object.entries(provider?.models ?? {})) {
+        // Two shapes exist: the flat `{ input, output, cache_read }` of the
+        // public API and OpenCode's cached per-modality form
+        // `{ text: { input: { price, cache: { read, write } }, output: … } }`.
+        const cost = model?.cost;
+        if (!cost) continue;
+        const flat = price(cost.input) !== null;
+        const text = cost.text ?? Object.values(cost)[0];
+        const input = flat ? price(cost.input) : price(text?.input?.price);
+        const output = flat ? price(cost.output) : price(text?.output?.price);
+        if (input === null || output === null) continue;
+        const key = String(modelId).toLowerCase();
+        if (!models.has(key)) models.set(key, []);
+        models.get(key).push({
+          provider: String(providerId),
+          input,
+          output,
+          cacheRead: flat ? price(cost.cache_read) : price(text?.input?.cache?.read),
+          cacheWrite: flat ? price(cost.cache_write) : price(text?.input?.cache?.write),
+        });
+      }
+    }
+  } catch {
+    return catalogCache.models;
+  }
+  catalogCache = { digest: /"digest":"([^"]+)"/.exec(head.head)?.[1] ?? null, models };
+  return models;
+};
+
+/**
+ * Longest catalog model id that prefixes the reply's model id, so quantised
+ * or variant names (qwen3.8-flash-next-huihui-v2-...) price as their base
+ * model. Ties resolve to the alphabetically first provider, deterministically.
+ */
+const catalogPriceForModel = (modelId) => {
+  const models = loadCatalog();
+  if (!models || !modelId) return null;
+  const id = String(modelId).toLowerCase();
+  let best = null;
+  for (const [key, entries] of models) {
+    if (!id.startsWith(key)) continue;
+    const rest = id.slice(key.length);
+    if (rest && !/^[-@:]/.test(rest)) continue;
+    if (!best || key.length > best.key.length) best = { key, entries };
+    else if (key.length === best.key.length) best.entries = best.entries.concat(entries);
+  }
+  if (!best) return null;
+  // $0/$0 rows are usually "unpriced" placeholders (e.g. amd), not real free
+  // tiers; prefer a priced reseller, then the alphabetically first provider.
+  const chosen = [...best.entries].sort((a, b) =>
+    ((a.input === 0 && a.output === 0) - (b.input === 0 && b.output === 0))
+    || a.provider.localeCompare(b.provider))[0];
+  return { ...chosen, label: `models.dev ${chosen.provider}/${best.key}` };
+};
+
 const compactTokens = (count) => {
   if (count >= 1e9) return `${(count / 1e9).toFixed(1)}B`;
   if (count >= 1e6) return `${(count / 1e6).toFixed(1)}M`;
@@ -501,6 +589,7 @@ const fetchCustomUsage = async (account) => {
         reasoning: 0,
         cacheRead: 0,
         cacheWrite: 0,
+        models: {},
         since: null,
         lastAt: 0,
         lastIds: [],
@@ -515,6 +604,22 @@ const fetchCustomUsage = async (account) => {
         AND time_created >= ?
       ORDER BY time_created, id
     `).all(account.integration, ledger.lastAt);
+    // Ledgers written before per-model tracking: rebuild the model split from
+    // the rows still present (older pruned rows only blur which model is top).
+    if (!ledger.models) {
+      const byModel = database.prepare(`
+        SELECT COALESCE(json_extract(data, '$.model.id'), 'unknown') AS mid,
+               SUM(COALESCE(json_extract(data, '$.tokens.input'), 0)
+                 + COALESCE(json_extract(data, '$.tokens.output'), 0)
+                 + COALESCE(json_extract(data, '$.tokens.reasoning'), 0)
+                 + COALESCE(json_extract(data, '$.tokens.cache.read'), 0)
+                 + COALESCE(json_extract(data, '$.tokens.cache.write'), 0)) AS tokens
+        FROM session_message
+        WHERE type = 'assistant' AND json_extract(data, '$.model.providerID') = ?
+        GROUP BY mid
+      `).all(account.integration);
+      ledger.models = Object.fromEntries(byModel.map((row) => [String(row.mid), Number(row.tokens) || 0]));
+    }
   } finally {
     database.close();
   }
@@ -532,11 +637,19 @@ const fetchCustomUsage = async (account) => {
       continue;
     }
     const tokens = message?.tokens ?? {};
+    const replyTokens = Math.max(0, finiteNumber(tokens.input) ?? 0)
+      + Math.max(0, finiteNumber(tokens.output) ?? 0)
+      + Math.max(0, finiteNumber(tokens.reasoning) ?? 0)
+      + Math.max(0, finiteNumber(tokens.cache?.read) ?? 0)
+      + Math.max(0, finiteNumber(tokens.cache?.write) ?? 0);
     ledger.input += Math.max(0, finiteNumber(tokens.input) ?? 0);
     ledger.output += Math.max(0, finiteNumber(tokens.output) ?? 0);
     ledger.reasoning += Math.max(0, finiteNumber(tokens.reasoning) ?? 0);
     ledger.cacheRead += Math.max(0, finiteNumber(tokens.cache?.read) ?? 0);
     ledger.cacheWrite += Math.max(0, finiteNumber(tokens.cache?.write) ?? 0);
+    const modelId = String(message?.model?.id ?? 'unknown');
+    ledger.models = ledger.models ?? {};
+    ledger.models[modelId] = (ledger.models[modelId] ?? 0) + replyTokens;
     ledger.replies += 1;
     ledger.since = ledger.since === null ? row.at : Math.min(ledger.since, row.at);
     ledger.lastIds.push(row.id);
@@ -545,13 +658,23 @@ const fetchCustomUsage = async (account) => {
   const totals = ledger;
 
   const settings = readConfig().customProviders?.[account.integration] ?? {};
-  const prices = {
+  let prices = {
     input: price(settings.input),
     output: price(settings.output),
     cacheRead: price(settings.cacheRead),
     cacheWrite: price(settings.cacheWrite),
   };
   prices.reasoning = price(settings.reasoning) ?? prices.output;
+  let pricedAs = typeof settings.pricedAs === 'string' ? settings.pricedAs : null;
+  if (prices.input === null || prices.output === null) {
+    const topModel = Object.entries(ledger.models ?? {}).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+    const auto = catalogPriceForModel(topModel);
+    if (auto) {
+      prices = { input: auto.input, output: auto.output, cacheRead: auto.cacheRead, cacheWrite: auto.cacheWrite };
+      prices.reasoning = auto.output;
+      pricedAs = auto.label;
+    }
+  }
   const priced = prices.input !== null && prices.output !== null;
   const cost = priced
     ? (totals.input * prices.input
@@ -587,7 +710,8 @@ const fetchCustomUsage = async (account) => {
     ],
     credits: null,
     plan: null,
-    note: priced ? null : `Set ${account.label} prices in ~/.config/openchamber-accounts-usage/config.json`,
+    pricedAs,
+    note: priced ? null : `No price found for ${account.label}; set one in ~/.config/openchamber-accounts-usage/config.json`,
   };
 };
 
@@ -787,7 +911,7 @@ const collectUncoalesced = async (force) => {
       resets: result.resets ?? null,
       note: result.note ?? null,
       pricedAs: account.provider === 'custom'
-        ? (readConfig().customProviders?.[account.integration]?.pricedAs ?? null)
+        ? (result.pricedAs ?? readConfig().customProviders?.[account.integration]?.pricedAs ?? null)
         : null,
       error: result.error ? result.error.slice(0, 300) : null,
       stale: Boolean(result.stale),
