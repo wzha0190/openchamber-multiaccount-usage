@@ -546,7 +546,7 @@ const catalogPriceForModel = (modelId) => {
 const compactTokens = (count) => {
   if (count >= 1e9) return `${(count / 1e9).toFixed(1)}B`;
   if (count >= 1e6) return `${(count / 1e6).toFixed(1)}M`;
-  if (count >= 1e3) return `${(count / 1e3).toFixed(1)}K`;
+  if (count >= 1e3) return `${(count / 1e3).toFixed(count >= 1e5 ? 0 : 1)}K`;
   return String(count);
 };
 
@@ -782,7 +782,9 @@ const fetchCustomUsage = async (account) => {
       },
       {
         label: 'Tokens',
-        sub: `in ${compactTokens(totals.input)}${estCached > 0 ? ` (~${compactTokens(estCached)} cached)` : ''} · out ${compactTokens(totals.output + totals.reasoning)}`,
+        // Kept short so the "Tokens" label is never truncated; the cache
+        // estimate is in the hover (pricedAs).
+        sub: `${compactTokens(totals.input)} in · ${compactTokens(totals.output + totals.reasoning)} out`,
         usedPercent: null,
         valueLabel: compactTokens(allTokens),
         resetAt: null,
