@@ -1,4 +1,4 @@
-// OpenChamber service for the "Accounts" Work Status section.
+// OpenChamber service for the "Multi-Account Usage" Work Status section.
 //
 // Reads every saved account at request time, so a newly added account shows up
 // on the next refresh without touching the extension:

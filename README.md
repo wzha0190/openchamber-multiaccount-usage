@@ -1,8 +1,8 @@
-# Accounts usage extension
+# Multi-Account Usage
 
-v2.4.0 (2026-11-16), OpenChamber ≥ 2.7.1.
+Requires OpenChamber ≥ 2.7.1.
 
-Adds an **Accounts** section to the chat's Work Status panel with one block per
+Adds a **Multi-Account Usage** section to the chat's Work Status panel with one block per
 saved account, laid out like the built-in provider blocks:
 
 ```
@@ -97,7 +97,7 @@ extension). Its 429s carry `retry-after: 0`, so after consecutive 429s the
 service backs off 5 → 10 → 20 → 40 → 60 min, the same 5 min floor and 1 h cap
 Claude Code uses, and keeps the last reading on screen as "Updated N min ago".
 
-The extension also serves an **Accounts** quota card (Usage page, header,
+The extension also serves a **Multi-Account Usage** quota card (Usage page, header,
 tray) listing every account's rows as `Codex work · 5-Hour`. To avoid
 seeing them twice in Work Status, untick that card under the Usage block's
 provider list.

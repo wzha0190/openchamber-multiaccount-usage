@@ -1,6 +1,6 @@
 {
   "name": "openchamber-accounts-usage",
-  "version": "2.6.3",
+  "version": "2.6.4",
   "private": true,
   "type": "module",
   "openchamber": {
@@ -11,12 +11,12 @@
     "contributes": {
       "panel": {
         "id": "codex-accounts-usage",
-        "name": "Accounts",
+        "name": "Multi-Account Usage",
         "icon": "group"
       },
       "statusSection": {
         "entry": "status/index.html",
-        "title": "Accounts",
+        "title": "Multi-Account Usage",
         "height": 260,
         "defaultExpanded": true
       },
