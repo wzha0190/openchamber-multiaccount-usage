@@ -54,6 +54,14 @@ change to the extension:
   says which catalog entry was used). Only if neither has a price does the
   block show tokens plus a note. A new machine therefore needs no config for
   well-known models.
+  Only completed replies are recorded (`time.completed`), so streaming
+  replies are never captured with partial token counts.
+  **Cache estimate:** some gateways (llama.cpp/vLLM-style) report no cached
+  tokens, so every agent turn's full context looks like fresh input. For such
+  providers the part of each prompt repeated from the session's previous turn
+  is priced at the cache-read rate, which is what a caching cloud API would charge.
+  The hover shows the estimated amount and the no-cache total. Set
+  `"estimateCache": false` to price all input as fresh, or `true` to force it.
   Totals run from the provider's first saved reply. The service appends every
   unseen API reply's actual returned token usage to its own persistent ledger;
   it never subtracts usage, even after OpenCode compacts or prunes that reply.

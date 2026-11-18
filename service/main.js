@@ -577,6 +577,26 @@ const readCustomAccounts = () => {
  * Once added, usage stays in our ledger even if OpenCode compacts or prunes the
  * message later. This is not a sum of OpenCode's mutable session snapshots.
  */
+/**
+ * Some servers (llama.cpp/vLLM-style gateways) report no cached tokens at all,
+ * so each agent turn's whole context counts as fresh input. A caching cloud
+ * API would bill the part repeated from the session's previous turn as a
+ * cache hit. Estimate that part: the previous prompt's size, when this prompt
+ * continued it (did not shrink by >10%, as compaction or a new branch does).
+ */
+const SESSION_LAST_MAX = 300;
+const noteCacheEstimate = (ledger, sessionId, input) => {
+  if (!sessionId) return;
+  ledger.sessionLast = ledger.sessionLast ?? {};
+  ledger.estCacheRead = ledger.estCacheRead ?? 0;
+  const last = ledger.sessionLast[sessionId];
+  if (last !== undefined && input >= last * 0.9) ledger.estCacheRead += Math.min(last, input);
+  delete ledger.sessionLast[sessionId];
+  ledger.sessionLast[sessionId] = input;
+  const ids = Object.keys(ledger.sessionLast);
+  for (const id of ids.slice(0, Math.max(0, ids.length - SESSION_LAST_MAX))) delete ledger.sessionLast[id];
+};
+
 const fetchCustomUsage = async (account) => {
   const database = new DatabaseSync(databasePath, { readOnly: true });
   const previous = customLedgers.get(account.integration);
@@ -589,6 +609,8 @@ const fetchCustomUsage = async (account) => {
         reasoning: 0,
         cacheRead: 0,
         cacheWrite: 0,
+        estCacheRead: 0,
+        sessionLast: {},
         models: {},
         since: null,
         lastAt: 0,
@@ -597,13 +619,28 @@ const fetchCustomUsage = async (account) => {
   let rows;
   try {
     rows = database.prepare(`
-      SELECT id, time_created AS at, data
+      SELECT id, session_id AS sid, time_created AS at, data
       FROM session_message
       WHERE type = 'assistant'
         AND json_extract(data, '$.model.providerID') = ?
         AND time_created >= ?
       ORDER BY time_created, id
     `).all(account.integration, ledger.lastAt);
+    // Ledgers from before cache estimation: replay the rows still present.
+    if (previous && ledger.estCacheRead === undefined && ledger.since !== null) {
+      ledger.estCacheRead = 0;
+      ledger.sessionLast = {};
+      const past = database.prepare(`
+        SELECT session_id AS sid, json_extract(data, '$.tokens.input') AS input
+        FROM session_message
+        WHERE type = 'assistant'
+          AND json_extract(data, '$.model.providerID') = ?
+          AND json_extract(data, '$.time.completed') IS NOT NULL
+          AND time_created >= ? AND time_created <= ?
+        ORDER BY time_created, id
+      `).all(account.integration, ledger.since, ledger.lastAt);
+      for (const row of past) noteCacheEstimate(ledger, row.sid, Number(row.input) || 0);
+    }
     // Ledgers written before per-model tracking: rebuild the model split from
     // the rows still present (older pruned rows only blur which model is top).
     if (!ledger.models) {
@@ -675,6 +712,7 @@ const fetchCustomUsage = async (account) => {
       + Math.max(0, finiteNumber(tokens.reasoning) ?? 0)
       + Math.max(0, finiteNumber(tokens.cache?.read) ?? 0)
       + Math.max(0, finiteNumber(tokens.cache?.write) ?? 0);
+    noteCacheEstimate(ledger, row.sid, Math.max(0, finiteNumber(tokens.input) ?? 0));
     ledger.input += Math.max(0, finiteNumber(tokens.input) ?? 0);
     ledger.output += Math.max(0, finiteNumber(tokens.output) ?? 0);
     ledger.reasoning += Math.max(0, finiteNumber(tokens.reasoning) ?? 0);
@@ -709,14 +747,24 @@ const fetchCustomUsage = async (account) => {
     }
   }
   const priced = prices.input !== null && prices.output !== null;
-  const cost = priced
-    ? (totals.input * prices.input
-      + totals.output * prices.output
-      + totals.reasoning * prices.reasoning
-      + totals.cacheRead * (prices.cacheRead ?? 0)
-      + totals.cacheWrite * (prices.cacheWrite ?? 0)) / 1e6
-    : null;
+  // Default: estimate only for providers that never report cache tokens.
+  const reportsCache = totals.cacheRead > 0 || totals.cacheWrite > 0;
+  const estimateCache = (typeof settings.estimateCache === 'boolean' ? settings.estimateCache : !reportsCache)
+    && prices.cacheRead !== null && (totals.estCacheRead ?? 0) > 0;
+  const estCached = estimateCache ? Math.min(totals.estCacheRead, totals.input) : 0;
+  const costOf = (cached) => (
+    (totals.input - cached) * prices.input
+    + cached * prices.cacheRead
+    + totals.output * prices.output
+    + totals.reasoning * prices.reasoning
+    + totals.cacheRead * (prices.cacheRead ?? 0)
+    + totals.cacheWrite * (prices.cacheWrite ?? 0)) / 1e6;
+  const cost = priced ? costOf(estCached) : null;
   const currency = typeof settings.currency === 'string' && settings.currency ? settings.currency : '$';
+  if (priced && estCached > 0) {
+    pricedAs = `${pricedAs ? `${pricedAs}; ` : ''}${compactTokens(estCached)} of input estimated as cache hits`
+      + ` (the provider reports none); without caching ${currency}${costOf(0).toFixed(2)}`;
+  }
   const since = totals.since
     ? new Date(totals.since).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
     : null;
@@ -734,7 +782,7 @@ const fetchCustomUsage = async (account) => {
       },
       {
         label: 'Tokens',
-        sub: `in ${compactTokens(totals.input)} · out ${compactTokens(totals.output + totals.reasoning)}`,
+        sub: `in ${compactTokens(totals.input)}${estCached > 0 ? ` (~${compactTokens(estCached)} cached)` : ''} · out ${compactTokens(totals.output + totals.reasoning)}`,
         usedPercent: null,
         valueLabel: compactTokens(allTokens),
         resetAt: null,
