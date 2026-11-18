@@ -785,12 +785,12 @@ const fetchCustomUsage = async (account) => {
         // Kept short so the "Tokens" label is never truncated; the cache
         // estimate is in the hover (pricedAs).
         // Share of prompt tokens served from cache: reported cache reads, or
-        // the estimate ("~") for providers that report none.
+        // the estimate for providers that report none (hover says which).
         sub: (() => {
           const prompt = totals.input + totals.cacheRead + totals.cacheWrite;
           const cached = totals.cacheRead + estCached;
           const share = prompt > 0 && cached > 0
-            ? ` · ${estCached > 0 ? '~' : ''}${Math.round((100 * cached) / prompt)}% cached`
+            ? ` · ${Math.round((100 * cached) / prompt)}% cached`
             : '';
           return `${compactTokens(prompt)} in${share} · ${compactTokens(totals.output + totals.reasoning)} out`;
         })(),
